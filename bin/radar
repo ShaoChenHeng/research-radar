@@ -48,9 +48,13 @@ _abort_rebase() {
 sync_pull() {
   _sync_on || return 0
   _abort_rebase
+  # 未配置 upstream 时裸 pull 会失败 → 回退到显式指定 origin/<当前分支>
+  local br; br="$(git -C "$SYNC_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)"; br="${br:-main}"
   if ! git -C "$SYNC_ROOT" pull --rebase --autostash >/dev/null 2>&1; then
-    echo "[radar] ⚠️ data 仓 pull 失败（可能冲突），已 abort，本轮不同步，下次再试" >&2
-    _abort_rebase
+    if ! git -C "$SYNC_ROOT" pull --rebase --autostash origin "$br" >/dev/null 2>&1; then
+      echo "[radar] ⚠️ data 仓 pull 失败（可能冲突或未配置 upstream），已 abort，本轮不同步，下次再试" >&2
+      _abort_rebase
+    fi
   fi
 }
 # 只提交「约定要同步」的数据（白名单），避免 git add -A 把私有/意外文件一并推走
@@ -71,7 +75,7 @@ sync_push() {
   git -C "$SYNC_ROOT" add -- "${paths[@]}" >/dev/null 2>&1 || true
   if git -C "$SYNC_ROOT" diff --cached --quiet; then return 0; fi   # 无暂存改动就不提交
   git -C "$SYNC_ROOT" -c user.name=radar -c user.email=radar@local commit -q -m "radar: ${RADAR_DATE:-update}" >/dev/null 2>&1 || true
-  git -C "$SYNC_ROOT" push -q >/dev/null 2>&1 || true
+  git -C "$SYNC_ROOT" push -q origin HEAD >/dev/null 2>&1 || true
 }
 
 # 等网络（最多 ~100s）
