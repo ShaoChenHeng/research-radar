@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Research Radar PDF 下载。
+
+用法:
+  radar-pdf [--date D] [--saved] <item-id...>
+说明:
+   - 从当天日报取条目的链接；能下 PDF 的（arXiv / 直接 .pdf）下到**当天文件夹** data/digest/YYYY/MM/<date>/，文件名用条目标题。
+  - 只对 config 里 `download = true` 的栏目生效；其余跳过并提示。
+  - 下载后在日报该条目下加/更新一行 `- **本地**：[相对路径](相对路径)`。
+"""
+import glob
+import os
+import re
+import subprocess
+import sys
+import tomllib
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG = os.path.join(ROOT, "config.toml")
+UA = "Research-Radar/1.0"
+
+ARXIV = re.compile(r"(?:arxiv\.org/abs/|arxiv\.org/pdf/|hf-mirror\.com/papers/|arXiv:)(\d{4}\.\d{4,5})")
+LINK = re.compile(r"\]\((https?://[^)]+)\)")
+MARK = re.compile(r"^\s*[-*]\s*\*\*标记\*\*\s*[:：]\s*(\S+)", re.M)
+SAVE = {"save", "收藏", "存", "star"}
+
+
+def load_cfg():
+    return tomllib.load(open(CONFIG, "rb")) if os.path.exists(CONFIG) else {}
+
+
+def digest_path(cfg, date):
+    ddir = os.path.join(ROOT, cfg.get("general", {}).get("data_dir", "data"),
+                        cfg.get("general", {}).get("digest_dir", "digest"))
+    if date:
+        y, m, _ = date.split("-")
+        return os.path.join(ddir, y, m, date, f"{date}.md")
+    files = sorted(glob.glob(os.path.join(ddir, "**", "*.md"), recursive=True))
+    return files[-1] if files else ""
+
+
+def section_items(text):
+    for m in re.finditer(r"^###\s*\[([A-Za-z]+)(\d+)\]\s*(.+?)\s*$(.*?)(?=^###\s*\[|^##\s|\Z)", text, re.S | re.M):
+        yield {"prefix": m.group(1), "num": int(m.group(2)), "title": m.group(3).strip(), "body": m.group(4)}
+
+
+def prefix_download(cfg):
+    return {s.get("prefix"): bool(s.get("download", True)) for s in cfg.get("sections", [])}
+
+
+def safe_name(s: str) -> str:
+    # 只替换路径分隔符与控制字符，尽量保持与标题一致
+    s = re.sub(r"[/\\\x00-\x1f]+", "-", s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return (s[:120].strip() or "paper")
+
+
+def download(url, out):
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    r = subprocess.run(["curl", "-fsSL", "-A", UA, "--retry", "2", "--retry-delay", "3",
+                        "--max-time", "120", "-o", out, url])
+    if r.returncode == 0 and os.path.getsize(out) > 1024:
+        return True
+    if os.path.exists(out):
+        os.remove(out)
+    return False
+
+
+def annotate(text, dg, item_key, pdf_abs):
+    rel = os.path.relpath(pdf_abs, os.path.dirname(dg))
+    line = f"- **本地**：[{rel}]({rel})"
+    pat = re.compile(rf"(^###\s*\[{re.escape(item_key)}\].*?)(?=^###\s*\[|^##\s|\Z)", re.S | re.M)
+    m = pat.search(text)
+    if not m:
+        return text
+    block = m.group(1)
+    if "- **本地**：" in block:
+        block2 = re.sub(r"^\s*[-*]\s*\*\*本地\*\*：.*$", line, block, count=1, flags=re.M)
+    else:
+        block2 = re.sub(r"(^\s*[-*]\s*\*\*标记\*\*：.*$)", r"\1\n" + line, block, count=1, flags=re.M)
+        if block2 == block:  # 没有标记行就追加到块尾
+            block2 = block.rstrip() + "\n" + line + "\n\n"
+    return text[:m.start(1)] + block2 + text[m.end(1):]
+
+
+def main():
+    args = sys.argv[1:]
+    date, saved, ids = "", False, []
+    i = 0
+    while i < len(args):
+        if args[i] == "--date":
+            date = args[i + 1]; i += 2
+        elif args[i] == "--saved":
+            saved = True; i += 1
+        else:
+            ids.append(args[i]); i += 1
+
+    cfg = load_cfg()
+    dg = digest_path(cfg, date)
+    if not dg or not os.path.exists(dg):
+        print("找不到日报", file=sys.stderr); return 1
+    text = open(dg, encoding="utf-8").read()
+    items = {f"{it['prefix']}{it['num']}": it for it in section_items(text)}
+    dndl = prefix_download(cfg)
+    base = os.path.basename(dg)[:-3]
+    y, m, _ = base.split("-")
+    # 日报所在目录（以日期为名的文件夹）——PDF 也放这里
+    day_dir = os.path.dirname(dg)
+
+    if saved:
+        for k, it in items.items():
+            mm = MARK.search(it["body"])
+            if mm and mm.group(1).strip().lower() in SAVE:
+                ids.append(k)
+    ids = list(dict.fromkeys(ids))
+    if not ids:
+        print("没有要下载的条目（给 id，或用 --saved 先标 save）"); return 1
+
+    ok = skip = 0
+    for key in ids:
+        it = items.get(key)
+        if not it:
+            print(f"  ✗ {key}: 日报里没这个条目"); continue
+        if not dndl.get(it["prefix"], True):
+            print(f"  – {key}: 该栏目 download=false（无 PDF），跳过"); skip += 1; continue
+        lm = LINK.search(it["body"])
+        url = lm.group(1) if lm else ""
+        am = ARXIV.search(it["body"]) or ARXIV.search(url)
+        if am:
+            pdf_url = f"https://arxiv.org/pdf/{am.group(1)}"
+        elif url.lower().endswith(".pdf"):
+            pdf_url = url
+        else:
+            print(f"  – {key}: 无 arXiv/pdf 链接，跳过"); skip += 1; continue
+        out = os.path.join(day_dir, safe_name(it["title"]) + ".pdf")
+        if download(pdf_url, out):
+            text = annotate(text, dg, key, out)
+            print(f"  ✓ {key}: {os.path.relpath(out, ROOT)}"); ok += 1
+        else:
+            print(f"  ✗ {key}: 下载失败 {pdf_url}"); skip += 1
+
+    with open(dg, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"完成：下载 {ok}，跳过 {skip}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

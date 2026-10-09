@@ -1,0 +1,168 @@
+# ============================================================
+# Research Radar 配置模板
+# 用法：cp config.example.toml config.toml 然后按需修改。
+# 所有可调项都在这里；[[sections]] 决定日报有哪些栏目。
+# ============================================================
+
+[general]
+timezone   = "Asia/Shanghai"
+data_dir   = "data"         # 数据仓根目录（独立私有 git 仓）
+digest_dir = "digest"       # 以下路径都相对 data_dir
+state_dir  = "state"
+hn_items   = 20             # Hacker News 取前 N 条详情
+# 多机同步：只有主机名等于此值的机器才会「生成」日报，其它机器只 pull/查看。
+# 留空 = 不限制（每台都能生成；此时注意只用一台开 timer）。取 `uname -n` 的短名。
+generate_on = ""
+# browser  = ""             # 可选：浏览器窗口类子串（如 "firefox"）。TUI 打开链接后用它把浏览器置顶；留空=自动识别常见浏览器
+
+[network]
+proxy       = ""            # 例: "http://127.0.0.1:7891"；留空=直连
+proxy_hosts = ["huggingface.co", "news.ycombinator.com"]
+
+[models]
+# 按顺序尝试，成功即止（可填免费或付费模型）。
+order = [
+  "deepseek/deepseek-flash",
+  "opencode/space-bunny-free",
+]
+
+[source_urls]
+arxiv_rss    = "https://rss.arxiv.org/rss"
+arxiv_api    = "https://export.arxiv.org/api/query"
+hf_daily     = "https://hf-mirror.com/api/daily_papers"
+hackernews   = "https://hacker-news.firebaseio.com/v0/topstories.json"
+hn_item_base = "https://hacker-news.firebaseio.com/v0/item"
+
+[rss]
+# 通用 RSS/Atom 源；某栏目 sources 里写 "rss" 即启用（默认按该栏 keywords 过滤）。
+# 若某栏想“不按关键词筛”（例如放一些轻松/有趣的综合源），在该栏写 require_keyword = false。
+feeds = [
+  "https://www.phoronix.com/rss.php",
+  "https://www.brendangregg.com/blog/rss.xml",    # 性能 / eBPF（原来写 http，会 301）
+  "https://jvns.ca/atom.xml",
+  "https://lwn.net/headlines/rss",
+  "https://archlinux.org/feeds/news/",
+  "https://www.ruanyifeng.com/blog/atom.xml",     # 科技爱好者周刊（中文，偏有趣）
+  "https://www.solidot.org/index.rss",            # 奇客资讯（中文科技趣闻）
+  "https://hackaday.com/blog/feed/",              # DIY / 硬件 hack（有趣）
+  "https://sachachua.com/blog/feed/",             # Sacha Chua（Emacs / org）
+]
+
+[curriculum]
+initial_size   = 40
+refresh_days   = 7
+learned_after  = 3
+add_per_queue  = 5
+intervals_days = [1, 3, 7, 16, 35]
+
+[feedback]
+exploration_ratio = 0.25
+
+[notify]
+enabled      = true
+persistent   = true         # true=常驻（点掉才消失）；false=自动关闭
+success_text = "日报已生成"
+
+# ============================================================
+# 日报栏目（顺序 = 出现顺序；可自由增删/改名/换主题）
+#   kind = "feed"   实时抓取 → 需 window_days / keywords / categories / sources
+#   kind = "queue"  课程队列（间隔重复）→ 需 queue 路径
+#   prefix = 条目 ID 前缀（a → a1,a2,…）
+#   fields = 三个分点标签：内容1 / 内容2 / 链接
+#   download = true|false  该栏条目是否有 PDF 可下（Arch Wiki 之类设 false）
+# ============================================================
+
+# ---- 栏目：实时抓取（示例：某领域新论文）----
+[[sections]]
+id     = "papers"
+prefix = "a"
+title  = "领域今日进展"
+kind   = "feed"
+min    = 3
+max    = 6
+fields = ["做了什么", "结论", "来源"]
+window_days = 3
+keywords    = ["fine-tuning", "fine-tune", "peft", "lora", "qlora", "adapter", "sft", "dpo", "rlhf",
+               "instruction tuning", "alignment", "distillation",
+               "rag", "retrieval", "retrieval-augmented", "retriever", "rerank", "reranking", "reranker",
+               "dense retrieval", "hybrid retrieval", "passage", "chunking", "query rewriting",
+               "query expansion", "multi-hop", "graphrag", "knowledge graph", "vector search",
+               "semantic search", "grounding", "citation", "attribution",
+               "encoder", "embedding", "sentence transformer", "bi-encoder", "cross-encoder",
+               "agent", "agentic", "tool use", "multi-agent", "reasoning", "chain-of-thought", "planning",
+               "evaluation", "benchmark", "inference", "quantization", "long-context"]
+categories  = ["cs.CL", "cs.LG", "cs.IR"]
+sources     = ["arxiv", "hf_daily", "hackernews"]
+max_per_group = 2           # 同一子方向最多 2 条（别整栏全是同一个方向）
+groups = [
+  { name = "检索/RAG", kw = ["rag", "retrieval", "retriever", "rerank", "reranking", "reranker",
+                             "dense retrieval", "hybrid retrieval", "passage", "chunk", "index",
+                             "vector search", "semantic search", "grounding", "citation"] },
+  { name = "编码器/表示", kw = ["encoder", "sentence transformer", "bi-encoder", "cross-encoder",
+                             "bert", "roberta", "electra", "deberta", "contrastive", "embedding"] },
+  { name = "微调", kw = ["fine-tuning", "fine-tune", "lora", "peft", "qlora", "adapter", "dpo",
+                        "rlhf", "instruction tuning", "distillation", "alignment"] },
+  { name = "agent/推理", kw = ["agent", "agentic", "tool use", "multi-agent", "planning",
+                             "reasoning", "chain-of-thought", "test-time"] },
+  { name = "系统/效率", kw = ["quantization", "inference", "serving", "kv cache", "sparse", "compression"] },
+]
+note    = "尽量覆盖不同子方向（检索/RAG、微调、agent/推理、评测…），各来一点、别偏科。"
+download    = true
+
+# ---- 栏目：课程队列（示例：领域知识）----
+[[sections]]
+id     = "knowledge"
+prefix = "b"
+title  = "领域知识"
+kind   = "queue"
+min    = 2
+max    = 5
+fields = ["要点", "为什么重要", "参考"]
+queue  = "state/curriculum.jsonl"
+download = true
+
+# ---- 栏目：课程队列（示例：Linux）----
+[[sections]]
+id     = "linux"
+prefix = "c"
+title  = "Linux 一点"
+kind   = "queue"
+min    = 2
+max    = 5
+fields = ["怎么做", "为什么有用", "参考"]
+queue  = "state/linux.jsonl"
+download = false
+
+# ---- 栏目：RSS 抓取（示例：科研 / 技术动态）----
+[[sections]]
+id     = "news"
+prefix = "d"
+title  = "科研 / 技术动态"
+kind   = "feed"
+min    = 1
+max    = 4
+fields = ["是什么", "为什么值得关注", "来源"]
+window_days = 14            # 博客更新慢，放宽时间窗
+keywords    = ["fine-tuning", "lora", "peft", "rag", "retrieval", "encoder", "embedding",
+               "evaluation", "llm", "transformer", "quantization", "inference", "vllm",
+               "agent", "emacs", "linux", "kernel", "performance", "ebpf", "rust"]
+categories  = []
+sources     = ["rss"]
+require_keyword = false     # 含“有趣/综合”源 → 不按关键词筛（keywords 仍用于排序）
+max_per_origin  = 2         # 同一来源网站最多 2 条（别整栏都来自同一个源）
+note    = "以科研 / 技术动态为主；尽量包含 1 条轻松有趣的科技见闻（奇客 / 科技周刊 / Emacs 社区周报 / DIY 硬件 hack）。没有合适的就省略。"
+download    = false
+
+# ---- 想加新栏目？复制一段 [[sections]] 即可，例如：----
+# [[sections]]
+# id     = "engineering"
+# prefix = "d"
+# title  = "工程动态"
+# kind   = "feed"
+# min    = 1
+# max    = 3
+# fields = ["是什么", "意义", "来源"]
+# window_days = 2
+# keywords    = ["llm serving", "vllm", "inference"]
+# categories  = []
+# sources     = ["hackernews"]

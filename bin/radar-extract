@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""把 data/state/raw/<date>/ 的原始抓取解析成紧凑候选 candidates.jsonl（每行一条 JSON）。
+会按 config.toml 的 feed 栏目预筛（关键词/时间窗），并应用反馈（屏蔽 + 主题加权 + 探索位）。
+
+用法: radar-extract <raw_dir> [config.toml]
+字段: source, title, link, id, date, abstract(截断)（rss 条目另有 origin=来源网站）
+"""
+import datetime
+import glob
+import json
+import os
+import random
+import re
+import sys
+import tomllib
+import urllib.parse
+from collections import defaultdict
+from email.utils import parsedate_to_datetime
+
+RAW = sys.argv[1] if len(sys.argv) > 1 else "."
+CFG = sys.argv[2] if len(sys.argv) > 2 else ""
+ABS_MAX = 1200
+RSS_PER_ORIGIN = 3   # rss 候选池里同一站点最多占几条（保证来源多样）
+
+KW, WINDOW, MUTE, BOOST, EXPLORE, RELAX = [], 3, [], {}, 0.25, set()
+SRC_KW = {}   # source -> set(该来源所属栏目的关键词)：避免各栏关键词互相“串味”
+if CFG and os.path.exists(CFG):
+    try:
+        C = tomllib.load(open(CFG, "rb"))
+        for s in C.get("sections", []):
+            if s.get("kind") == "feed":
+                kws = [k.lower() for k in s.get("keywords", [])]
+                KW += kws
+                srcs = s.get("sources") or []
+                for src in srcs:
+                    SRC_KW.setdefault(src, set()).update(kws)
+                WINDOW = max(WINDOW, int(s.get("window_days", 3)))
+                if s.get("require_keyword", True) is False:
+                    # 该栏目声明“不按关键词筛”（如“有趣/综合”类源）
+                    RELAX |= set(srcs)
+        KW = list(dict.fromkeys(KW))
+        EXPLORE = float(C.get("feedback", {}).get("exploration_ratio", 0.25))
+        gen = C.get("general", {})
+        fbp = os.path.join(os.path.dirname(os.path.abspath(CFG)),
+                           gen.get("data_dir", "data"), gen.get("state_dir", "state"), "feedback.jsonl")
+        if os.path.exists(fbp):
+            for line in open(fbp, encoding="utf-8"):
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                t = str(r.get("target", "")).lower()
+                if r.get("type") == "mute" and t:
+                    MUTE.append(t)
+                elif r.get("type") == "topic" and t:
+                    BOOST[t] = BOOST.get(t, 0) + (1 if r.get("signal") == "more" else -1)
+                elif r.get("type") == "item":
+                    w = 1 if r.get("signal") in ("like", "save") else -1
+                    for x in r.get("topics", []):
+                        k = str(x).lower()
+                        if k:
+                            BOOST[k] = BOOST.get(k, 0) + w
+    except (OSError, tomllib.TOMLDecodeError, ValueError, json.JSONDecodeError):
+        pass
+
+
+def clean(s: str) -> str:
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def origin(link: str) -> str:
+    """链接的站点域名（去 www.），用于「同一来源最多 N 条」。"""
+    try:
+        host = urllib.parse.urlparse(link or "").netloc.lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def tag(block: str, name: str) -> str:
+    m = re.search(rf"<{name}>(.*?)</{name}>", block, re.S)
+    return clean(m.group(1)) if m else ""
+
+
+def parse_date(s: str):
+    if not s:
+        return None
+    try:
+        return parsedate_to_datetime(s)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def from_arxiv(raw_dir: str):
+    for f in glob.glob(os.path.join(raw_dir, "arxiv_*.xml")):
+        try:
+            txt = open(f, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        for item in re.findall(r"<item>(.*?)</item>", txt, re.S):
+            title = tag(item, "title")
+            link = tag(item, "link")
+            desc = tag(item, "description")
+            m = re.search(r"arXiv:(\d{4}\.\d{4,5})", desc) or re.search(r"abs/(\d{4}\.\d{4,5})", link)
+            aid = m.group(1) if m else ""
+            yield {"source": "arxiv", "title": title,
+                   "link": link or (f"https://arxiv.org/abs/{aid}" if aid else ""),
+                   "id": aid, "date": tag(item, "pubDate"), "abstract": desc[:ABS_MAX],
+                   "_text": (title + " " + desc).lower()}
+
+
+def from_hf(raw_dir: str):
+    path = os.path.join(raw_dir, "hf_daily.json")
+    if not os.path.exists(path):
+        return
+    try:
+        data = json.load(open(path, encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, list):
+        data = data.get("papers", []) if isinstance(data, dict) else []
+    for entry in data:
+        paper = entry.get("paper", entry) or {}
+        pid = paper.get("id") or entry.get("id") or ""
+        title = paper.get("title") or entry.get("title") or ""
+        summary = paper.get("summary") or entry.get("summary") or ""
+        yield {"source": "hf_daily", "title": title,
+               "link": f"https://hf-mirror.com/papers/{pid}" if pid else "",
+               "id": pid,
+               "date": entry.get("submittedOnDailyAt") or entry.get("publishedAt") or paper.get("publishedAt") or "",
+               "abstract": summary[:ABS_MAX], "_text": (title + " " + summary).lower()}
+
+
+def from_hn(raw_dir: str):
+    for f in glob.glob(os.path.join(raw_dir, "hn", "*.json")):
+        try:
+            s = json.load(open(f, encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(s, dict) or not s.get("title"):
+            continue
+        t = s.get("time")
+        try:
+            date = datetime.datetime.fromtimestamp(int(t), datetime.timezone.utc).isoformat() if t else ""
+        except (ValueError, TypeError):
+            date = ""
+        text = clean(s.get("text", ""))
+        title = s.get("title", "")
+        yield {"source": "hackernews", "title": title,
+               "link": s.get("url") or f"https://news.ycombinator.com/item?id={s.get('id')}",
+               "id": str(s.get("id", "")), "date": date, "abstract": text[:ABS_MAX],
+               "_text": (title + " " + text).lower()}
+
+
+def from_rss(raw_dir: str):
+    import xml.etree.ElementTree as ET
+
+    def local(el):
+        return el.tag.rsplit("}", 1)[-1]
+
+    for f in glob.glob(os.path.join(raw_dir, "rss", "*.xml")):
+        try:
+            root = ET.parse(f).getroot()
+        except (OSError, ET.ParseError):
+            continue
+        for el in root.iter():
+            if local(el) not in ("item", "entry"):
+                continue
+            title = link = date = desc = ""
+            for ch in el:
+                n = local(ch)
+                if n == "title" and not title:
+                    title = "".join(ch.itertext()).strip()
+                elif n == "link" and not link:
+                    link = ch.get("href") or "".join(ch.itertext()).strip()
+                elif n in ("pubDate", "published", "updated", "date") and not date:
+                    date = "".join(ch.itertext()).strip()
+                elif n in ("description", "summary", "content") and not desc:
+                    desc = clean("".join(ch.itertext()))
+            if title:
+                yield {"source": "rss", "title": clean(title), "link": link, "id": "",
+                       "origin": origin(link), "date": date, "abstract": desc[:ABS_MAX],
+                       "_text": (title + " " + desc).lower()}
+
+
+def kws_for(r):
+    """该候选所属栏目的关键词（找不到归属就用全局）。"""
+    return SRC_KW.get(r.get("source")) or KW
+
+
+def hit(r) -> bool:
+    if not KW:
+        return True
+    if r.get("source") in RELAX:
+        return True
+    return any(k in (r.get("_text") or "") for k in kws_for(r))
+
+
+def within(r) -> bool:
+    dt = parse_date(r["date"])
+    if dt is None:
+        return True
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return (datetime.datetime.now(datetime.timezone.utc) - dt).days <= WINDOW + 1
+
+
+def muted(r) -> bool:
+    t = r.get("_text") or ""
+    return any(m in t for m in MUTE)
+
+
+def score(r) -> float:
+    t = r.get("title", "").lower()
+    a = r.get("abstract", "").lower()
+    kws = kws_for(r)
+    s = sum(2 for k in kws if k in t) + sum(1 for k in kws if k in a)
+    for k, w in BOOST.items():
+        if k in t:
+            s += 3 * w
+        elif k in a:
+            s += 1 * w
+    return s
+
+
+def main():
+    rows = [r for r in (list(from_arxiv(RAW)) + list(from_hf(RAW)) + list(from_hn(RAW)) + list(from_rss(RAW))) if r["title"]]
+    total = len(rows)
+    kept = [r for r in rows if hit(r) and within(r) and not muted(r)]
+    kept.sort(key=lambda r: (score(r), r["date"]), reverse=True)
+
+    caps = {"arxiv": 25, "hf_daily": 10, "hackernews": 10, "rss": 15}
+    random.seed(RAW)
+    bysrc = defaultdict(list)
+    for r in kept:
+        bysrc[r["source"]].append(r)
+    selected = []
+    for src, lst in bysrc.items():
+        cap = caps.get(src, 25)
+        if src == "rss":
+            # 先保“来源多样”：同一站点先各取最多 RSS_PER_ORIGIN 条，再回填到 cap
+            cnt = defaultdict(int)
+            spread, back = [], []
+            for r in lst:
+                o = r.get("origin") or ""
+                if cnt[o] < RSS_PER_ORIGIN:
+                    cnt[o] += 1
+                    spread.append(r)
+                else:
+                    back.append(r)
+            lst = spread + back
+        exp = int(cap * EXPLORE)
+        head = lst[: cap - exp]
+        rest = lst[cap - exp:]
+        pick = random.sample(rest, min(exp, len(rest))) if rest else []
+        selected += head + pick
+    selected.sort(key=lambda r: score(r), reverse=True)
+
+    for r in selected:
+        r.pop("_text", None)
+    out = os.path.join(RAW, "candidates.jsonl")
+    with open(out, "w", encoding="utf-8") as fh:
+        for r in selected:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    used = defaultdict(int)
+    for r in selected:
+        used[r["source"]] += 1
+    print(f"[radar-extract] 原始 {total} → 候选 {len(selected)} 条 -> {out}"
+          f"（{', '.join(f'{k}:{v}' for k, v in used.items())}）"
+          f"{'  [已屏蔽 %d 项]' % len(MUTE) if MUTE else ''}")
+
+
+if __name__ == "__main__":
+    main()

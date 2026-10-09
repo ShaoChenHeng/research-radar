@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# radar-setup-host —— 在新主机上接收并部署 Research Radar。
+#
+# 两种跑法：
+#   1) 还没有仓库时（首次迁移）：本脚本会先 `tailscale file get` 拿到 tar 包、解包、修权限；
+#   2) 已经在仓库里：`research-radar/bin/radar-setup-host` 只做依赖检查 / 软链 / （可选）systemd。
+#
+# 用法: radar-setup-host [--dir DIR] [--tar FILE] [--no-get] [--install-units] [--force]
+# 注意：systemd timer **默认不装**；两台机器只能开一台，见 docs/PORTING.md。
+set -euo pipefail
+
+DIR="$HOME/github-project"
+TAR=""
+DO_GET=auto            # auto | yes | no
+INSTALL_UNITS=0
+FORCE=0
+PKGS="git curl python rsync util-linux libnotify wl-clipboard"
+TARNAME="radar-migrate.tar.gz"
+
+say()  { printf '\033[1m[setup]\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m[setup] ⚠️  %s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[31m[setup] ❌ %s\033[0m\n' "$*" >&2; exit 1; }
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dir)           DIR="${2:?}"; shift 2;;
+    --tar)           TAR="${2:?}"; shift 2;;
+    --no-get)        DO_GET=no; shift;;
+    --install-units) INSTALL_UNITS=1; shift;;
+    --force)         FORCE=1; shift;;
+    -h|--help)       usage;;
+    *) die "未知参数: $1（-h 看用法）";;
+  esac
+done
+
+DIR="${DIR/#\~/$HOME}"
+mkdir -p "$DIR"
+
+ROOTDIR="$DIR/research-radar"
+# 也可能是在仓库目录里直接运行本脚本
+if [[ ! -d "$ROOTDIR" && -x "$PWD/bin/radar" && -f "$PWD/config.example.toml" ]]; then
+  ROOTDIR="$PWD"
+fi
+
+# ---------- 1) 拿到压缩包 / 2) 解包 ----------
+# 已经在仓库里 → 跳过取包与解包，只做后面的检查 / 软链 / 单元
+if [[ -d "$ROOTDIR" && "$FORCE" != 1 ]]; then
+  say "检测到已存在的仓库，跳过取包/解包: $ROOTDIR"
+else
+  if [[ -z "$TAR" ]]; then
+    for c in "$DIR/$TARNAME" "./$TARNAME" "$TARNAME"; do
+      [[ -f "$c" ]] && { TAR="$c"; break; }
+    done
+  fi
+  if [[ -z "$TAR" && "$DO_GET" != "no" ]]; then
+    command -v tailscale >/dev/null || die "没找到 tailscale，也没有 $TARNAME；请手动把包放到 $DIR/（或 --no-get 后在已有仓库内运行）"
+    say "用 Taildrop 取包到 $DIR …"
+    if ! (cd "$DIR" && tailscale file get . 2>/dev/null); then
+      warn "普通权限取不到，改用 sudo（可能需要输密码）"
+      (cd "$DIR" && sudo tailscale file get .)
+      # sudo 取回的文件属 root，稍后统一 chown
+    fi
+    [[ -f "$DIR/$TARNAME" ]] && TAR="$DIR/$TARNAME"
+  fi
+  [[ -n "$TAR" && -f "$TAR" ]] || die "找不到压缩包（用 --tar 指定；或确认已在 $ROOTDIR 仓库内直接运行）"
+  say "压缩包: $TAR ($(du -h "$TAR" | cut -f1))"
+
+  cd "$DIR"
+  if [[ -e "$ROOTDIR" ]]; then
+    warn "--force：删除已存在的 $ROOTDIR 后重新解包"
+    rm -rf "$ROOTDIR"
+  fi
+  say "解包到 $DIR …"
+  tar xzf "$TAR"
+
+  # sudo 取回来的包 + 解出的目录可能属 root → 修回来
+  if [[ "$(id -u)" -ne 0 ]] && find "$ROOTDIR" -maxdepth 0 ! -user "$(id -un)" -print -quit 2>/dev/null | grep -q .; then
+    say "修正文件属主（root → $(id -un)）…"
+    sudo chown -R "$(id -un):$(id -gn)" "$ROOTDIR" "$TAR" || warn "chown 失败，可能需要手动处理"
+  fi
+fi
+
+cd "$ROOTDIR" || die "仓库目录不存在: $ROOTDIR"
+[[ -d "$ROOTDIR" ]] || die "没看到 $ROOTDIR，包结构不对？"
+find "$ROOTDIR/bin" -maxdepth 1 -type f -exec chmod +x {} + 2>/dev/null || true
+say "仓库就绪: $ROOTDIR"
+
+# ---------- 3) 依赖检查 ----------
+say "检查依赖…"
+missing=()
+for c in git curl python3 flock rsync notify-send; do
+  command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+done
+command -v opencode >/dev/null 2>&1 || missing+=("opencode")
+if [[ ${#missing[@]} -gt 0 ]]; then
+  warn "缺少: ${missing[*]}"
+  echo "      Arch 上装：sudo pacman -S --needed $PKGS"
+  echo "      opencode 单独装（≥2），装完记得：opencode auth login   # 选 DeepSeek"
+else
+  say "依赖齐全 ✓"
+fi
+# 可选增强
+for c in qdbus6 wl-copy; do command -v "$c" >/dev/null 2>&1 || warn "可选缺 $c（$([[ $c == wl-copy ]] && echo 'Y 复制链接' || echo '浏览器置顶')) ——不影响主体"; done
+
+# ---------- 4) radar 命令进 PATH ----------
+BIN="$HOME/.local/bin"
+mkdir -p "$BIN"
+ln -sf "$ROOTDIR/bin/radar" "$BIN/radar"
+case ":$PATH:" in
+  *":$BIN:"*) say "软链好了: $BIN/radar ✓";;
+  *) warn "$BIN 不在 PATH 里 —— 加一行到 ~/.bashrc / ~/.zshrc：export PATH=\"\$HOME/.local/bin:\$PATH\"";;
+esac
+[[ -x "$ROOTDIR/bin/radar-tui" ]] && python3 -c "import ast,sys;ast.parse(open('$ROOTDIR/bin/radar-tui').read())" \
+  && say "自检: radar-tui 语法 OK"
+(cd "$ROOTDIR" && ./bin/radar --help >/dev/null 2>&1) && say "自检: radar --help OK" || warn "radar --help 没跑通，检查一下 config.toml / 权限"
+
+# ---------- 5) systemd（默认不装） ----------
+if [[ "$INSTALL_UNITS" == 1 ]]; then
+  warn "启用 timer —— 确认这台是「主生成」的机器，否则两台会同一天各生成一份！"
+  (cd "$ROOTDIR" && ./bin/radar-install-units)
+else
+  say "未安装 systemd 单元（默认）。要装就重跑并加 --install-units —— 且**两台机只能开一台**。"
+fi
+
+# ---------- 6) 后续手动步骤 ----------
+cat <<EOF
+
+[setup] 完成。还需要你手动做的：
+  1) OpenCode 登录（凭据不随包迁移）：      opencode auth login     # 选 DeepSeek
+  2) Emacs 侧（可选）：建 ~/.emacs.d/lisp/init-radar.el，把
+     $ROOTDIR/emacs 加进 load-path 并 (require 'radar)，绑定入口（如 C-c R）
+  3) 跨机同步（以后）：给 data/ 加 remote
+     cd $ROOTDIR/data && git remote add origin <私有仓> && git branch -M main && git push -u origin main
+  4) 试跑一次：radar            （TUI）
+     注意：manbo 上没有本机的 opencode 会话库，日报的 C 细聊会走兜底（本机 session + 预制 prompt）
+
+详见 $ROOTDIR/docs/PORTING.md
+EOF

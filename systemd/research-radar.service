@@ -1,0 +1,8 @@
+[Unit]
+Description=Research Radar daily digest
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/github-project/research-radar
+ExecStart=%h/github-project/research-radar/bin/radar run

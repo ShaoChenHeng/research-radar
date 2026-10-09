@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""课程队列工具（阶段 6）。
+
+用法:
+  radar-curriculum archive <queue.jsonl> <learned_after> <date>
+      把 times >= learned_after 的条目标为 learned。
+  radar-curriculum input   <out.json> <config.toml> <date>
+      生成给模型的输入（各队列现状 + 反馈偏好）。
+  radar-curriculum apply   <proposal.json> <config.toml> <date>
+      校验并追加模型建议的新条目（refs 必须可访问；topic 不重复）。
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tomllib
+
+UA = "Research-Radar/1.0"
+
+
+def load_jsonl(path):
+    rows = []
+    if os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def write_jsonl(path, rows):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def load_cfg(path):
+    return tomllib.load(open(path, "rb"))
+
+
+def root_of(cfg_path):
+    return os.path.dirname(os.path.abspath(cfg_path))
+
+
+def data_root(cfg_path, cfg):
+    return os.path.join(root_of(cfg_path), cfg.get("general", {}).get("data_dir", "data"))
+
+
+def queues(cfg):
+    return [s for s in cfg.get("sections", []) if s.get("kind") == "queue"]
+
+
+def norm(s):
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (s or "").lower())
+
+
+def url_ok(url):
+    try:
+        code = subprocess.run(
+            ["curl", "-fsSL", "-A", UA, "--max-time", "12", "-o", os.devnull,
+             "-w", "%{http_code}", url],
+            capture_output=True, text=True, timeout=20).stdout.strip()
+        return code[:1] in ("2", "3")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def cmd_archive(argv):
+    path, after, date = argv[0], int(argv[1]), argv[2]
+    rows = load_jsonl(path)
+    n = 0
+    for r in rows:
+        if r.get("status", "active") == "active" and int(r.get("times", 0)) >= after:
+            r["status"] = "learned"
+            n += 1
+    write_jsonl(path, rows)
+    print(f"  archive {os.path.basename(path)}: {n} 条 → learned")
+    return 0
+
+
+def cmd_input(argv):
+    out, cfg_path, date = argv[0], argv[1], argv[2]
+    cfg = load_cfg(cfg_path)
+    droot = data_root(cfg_path, cfg)
+    add = int(cfg.get("curriculum", {}).get("add_per_queue", 5))
+    data = {"date": date, "add_per_queue": add, "queues": {}}
+    for s in queues(cfg):
+        rows = load_jsonl(os.path.join(droot, s["queue"]))
+        active = [r for r in rows if r.get("status", "active") == "active"]
+        data["queues"][s["id"]] = {
+            "title": s.get("title", s["id"]),
+            "levels": "1=基础 2=进阶 3=前沿",
+            "existing_topics": [r.get("topic", "") for r in active],
+            "existing_levels": sorted({int(r.get("level", 1)) for r in active}),
+        }
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    json.dump(data, open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    print(f"  已写 {out}（{', '.join(data['queues'])}）")
+    return 0
+
+
+def cmd_apply(argv):
+    prop_path, cfg_path, date = argv[0], argv[1], argv[2]
+    if not os.path.exists(prop_path):
+        print(f"  找不到提案 {prop_path}", file=sys.stderr); return 1
+    try:
+        prop = json.load(open(prop_path, encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"  提案 JSON 解析失败：{e}", file=sys.stderr); return 1
+    cfg = load_cfg(cfg_path)
+    droot = data_root(cfg_path, cfg)
+    total = 0
+    for s in queues(cfg):
+        path = os.path.join(droot, s["queue"])
+        rows = load_jsonl(path)
+        have = {norm(r.get("topic", "")) for r in rows}
+        # 复用现有条目 id 的前缀（如 k/l）；否则退回栏目 prefix
+        from collections import Counter
+        mm = [x for x in (re.match(r"^([A-Za-z]+)(\d+)$", r.get("id", "")) for r in rows) if x]
+        if mm:
+            pref = Counter(x.group(1) for x in mm).most_common(1)[0][0]
+            nums = [int(x.group(2)) for x in mm if x.group(1) == pref]
+        else:
+            pref = s.get("prefix", "x"); nums = []
+        nextn = max(nums) + 1 if nums else 1
+        added = 0
+        for item in (prop.get(s["id"]) or []):
+            topic = (item.get("topic") or "").strip()
+            if not topic or norm(topic) in have:
+                continue
+            refs = [u for u in (item.get("refs") or []) if u.startswith("http") and url_ok(u)]
+            if not refs:
+                print(f"    ✗ 跳过（无可访问参考）：{topic[:40]}")
+                continue
+            lvl = int(item.get("level", 2))
+            rows.append({
+                "id": f"{pref}{nextn:02d}", "topic": topic,
+                "gist": item.get("gist", ""), "why": item.get("why", ""), "refs": refs,
+                "level": max(1, min(3, lvl)),
+                "added": date, "last_shown": "", "times": 0, "interval": 0, "due": date,
+                "status": "active",
+            })
+            have.add(norm(topic)); nextn += 1; added += 1
+        write_jsonl(path, rows)
+        print(f"  apply {os.path.basename(path)}: +{added} 条")
+        total += added
+    print(f"  共新增 {total} 条")
+    return 0
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__); return 2
+    cmd, argv = sys.argv[1], sys.argv[2:]
+    table = {"archive": cmd_archive, "input": cmd_input, "apply": cmd_apply}
+    if cmd not in table:
+        print(f"未知子命令: {cmd}\n{__doc__}"); return 2
+    return table[cmd](argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

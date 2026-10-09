@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""读 config.toml 的 [[sections]]，给 shell 用的查询工具。
+
+用法: radar-config <config.toml> <key>
+  feed-categories   所有 feed 栏目的 categories 并集（每行一个）
+  feed-sources      所有 feed 栏目的 sources 并集（每行一个）
+  feed-prefixes     所有 feed 栏目的 prefix（每行一个）
+  queue-sections    每个 queue 栏目一行: id <TAB> min <TAB> max <TAB> queue
+  section-count     栏目数量
+"""
+import sys
+import tomllib
+
+
+def load(path):
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def main():
+    if len(sys.argv) < 3:
+        print(__doc__)
+        return 2
+    cfg_path, key = sys.argv[1], sys.argv[2]
+    cfg = load(cfg_path)
+    sections = cfg.get("sections", [])
+
+    if key == "feed-categories":
+        seen, out = set(), []
+        for s in sections:
+            if s.get("kind") == "feed":
+                for c in s.get("categories", []):
+                    if c not in seen:
+                        seen.add(c); out.append(c)
+        print("\n".join(out))
+    elif key == "feed-sources":
+        seen, out = set(), []
+        for s in sections:
+            if s.get("kind") == "feed":
+                for c in s.get("sources", []):
+                    if c not in seen:
+                        seen.add(c); out.append(c)
+        print("\n".join(out))
+    elif key == "feed-prefixes":
+        print("\n".join(s.get("prefix", "") for s in sections if s.get("kind") == "feed"))
+    elif key == "queue-sections":
+        for s in sections:
+            if s.get("kind") == "queue":
+                print(f"{s.get('id','')}\t{s.get('min',1)}\t{s.get('max',2)}\t{s.get('queue','')}")
+    elif key == "section-count":
+        print(len(sections))
+    else:
+        print(f"未知 key: {key}\n{__doc__}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

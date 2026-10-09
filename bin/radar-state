@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Research Radar 状态工具：课程队列（间隔重复）、seen 去重。
+
+子命令:
+  queue-pick  <queue.jsonl> <min> <max> <date> <intervals_csv>
+      选出 due<=date 的条目，更新 times/interval/due，写回文件；stdout 打印所选 JSON 数组。
+  seen-filter <in.jsonl> <seen.jsonl> <out.jsonl>
+      过滤掉 seen 里已有的候选，写到 out；stdout 打印统计。
+  seen-record <digest.md> <seen.jsonl> <date> <host>
+      从日报的「微调 / RAG」小节抽取论文键，追加进 seen；stdout 打印新增数。
+"""
+import datetime
+import json
+import os
+import random
+import re
+import sys
+
+
+def load_jsonl(path):
+    rows = []
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+    return rows
+
+
+def write_jsonl(path, rows):
+    if os.environ.get("RADAR_DRY") == "1":   # dry-run：不改任何状态
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def cand_key(r):
+    if r.get("id"):
+        return f"{r.get('source','?')}:{r['id']}"
+    return f"url:{r.get('link','')}"
+
+
+# ---------- queue-pick ----------
+def cmd_queue_pick(argv):
+    path, mn, mx, today, intervals_csv = argv
+    mn, mx = int(mn), int(mx)
+    intervals = [int(x) for x in intervals_csv.split(",") if x.strip()]
+    rows = load_jsonl(path)
+    today_d = datetime.date.fromisoformat(today)
+
+    active = [r for r in rows if r.get("status", "active") == "active"]
+    due = [r for r in active if not r.get("due") or r["due"] <= today]
+    due.sort(key=lambda r: (r.get("due", ""), r.get("level", 1), r.get("id", "")))
+
+    # 确定性随机：按日期播种，让每天取的数量在 [min,max] 内变化
+    random.seed(f"{os.path.basename(path)}:{today}")
+    n = random.randint(mn, mx) if mx >= mn else mn
+
+    chosen = due[:n]
+    if len(chosen) < mn:  # 到期不足则按最早 due 补足
+        rest = [r for r in active if r not in chosen]
+        rest.sort(key=lambda r: (r.get("due", ""), r.get("level", 1), r.get("id", "")))
+        chosen += rest[: mn - len(chosen)]
+
+    for r in chosen:
+        r["times"] = int(r.get("times", 0)) + 1
+        idx = min(r["times"] - 1, len(intervals) - 1)
+        r["interval"] = intervals[idx] if intervals else 1
+        r["last_shown"] = today
+        r["due"] = (today_d + datetime.timedelta(days=r["interval"])).isoformat()
+    write_jsonl(path, rows)
+
+    print(json.dumps(chosen, ensure_ascii=False))
+    return 0
+
+
+# ---------- seen-filter ----------
+def cmd_seen_filter(argv):
+    in_path, seen_path, out_path = argv
+    seen = {r.get("key") for r in load_jsonl(seen_path)}
+    rows = load_jsonl(in_path)
+    kept = [r for r in rows if cand_key(r) not in seen]
+    write_jsonl(out_path, kept)
+    print(f"[radar-state] seen-filter: {len(rows)} -> {len(kept)}（已见 {len(rows)-len(kept)}）")
+    return 0
+
+
+# ---------- seen-record ----------
+ARXIV = re.compile(r"(?:arxiv\.org/abs/|arXiv:)(\d{4}\.\d{4,5})")
+HF = re.compile(r"hf-mirror\.com/papers/([\w.\-]+)")
+HN = re.compile(r"news\.ycombinator\.com/item\?id=(\d+)")
+
+
+def norm(s: str) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (s or "").lower())
+
+
+def cmd_seen_record(argv):
+    digest_path, seen_path, today, host = argv[:4]
+    cand_path = argv[4] if len(argv) > 4 else ""
+    cfg_path = argv[5] if len(argv) > 5 else ""
+    text = open(digest_path, encoding="utf-8").read()
+
+    feed = []
+    if cfg_path and os.path.exists(cfg_path):
+        try:
+            import tomllib
+            c = tomllib.load(open(cfg_path, "rb"))
+            feed = [(s.get("title", ""), s.get("prefix", ""))
+                    for s in c.get("sections", []) if s.get("kind") == "feed"]
+        except (OSError, ValueError):
+            pass
+    if not feed:
+        feed = [("", "a")]   # 兜底
+
+    keys = {}
+    headers = []
+    for title, prefix in feed:
+        if title:
+            m = re.search(rf"^##\s*{re.escape(title)}\s*$(.*?)(?=^##\s|\Z)", text, re.S | re.M)
+            section = m.group(1) if m else ""
+        else:
+            section = text
+        for aid in ARXIV.findall(section):
+            keys[f"arxiv:{aid}"] = f"https://arxiv.org/abs/{aid}"
+        for hid in HF.findall(section):
+            keys[f"hf_daily:{hid}"] = f"https://hf-mirror.com/papers/{hid}"
+        for nid in HN.findall(section):
+            keys[f"hackernews:{nid}"] = f"https://news.ycombinator.com/item?id={nid}"
+        if prefix:
+            headers += [norm(h) for h in re.findall(rf"^###\s*\[{re.escape(prefix)}\d+\]\s*(.+)$", section, re.M)]
+
+    # 标题匹配兜底：agent 漏写链接时，按条目标题认领候选
+    if cand_path and os.path.exists(cand_path) and headers:
+        for r in load_jsonl(cand_path):
+            nt = norm(r.get("title", ""))
+            if len(nt) < 8:
+                continue
+            if any(nt in h or h in nt for h in headers):
+                keys.setdefault(cand_key(r), r.get("link") or "")
+
+    seen = load_jsonl(seen_path)
+    have = {r.get("key") for r in seen}
+    added = 0
+    for k, url in keys.items():
+        if k not in have:
+            seen.append({"key": k, "kind": "paper", "url": url, "date": today, "host": host})
+            added += 1
+    write_jsonl(seen_path, seen)
+    print(f"[radar-state] seen-record: 新增 {added} 条（键 {len(keys)}）")
+    return 0
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 2
+    cmd, argv = sys.argv[1], sys.argv[2:]
+    if cmd == "queue-pick":
+        return cmd_queue_pick(argv)
+    if cmd == "seen-filter":
+        return cmd_seen_filter(argv)
+    if cmd == "seen-record":
+        return cmd_seen_record(argv)
+    print(f"未知子命令: {cmd}\n{__doc__}")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

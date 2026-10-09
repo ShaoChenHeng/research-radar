@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+# Research Radar —— 阶段 2.5：栏目可配置（[[sections]] 驱动）
+# 流程：runner 预抓 → 解析候选 → seen 去重 → 队列选（queue 栏目）→ agent 成文 → 记录 seen
+# 用法: radar run [--date YYYY-MM-DD] [--dry-run] [--no-fetch]
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+cd "$ROOT"
+CONFIG="$ROOT/config.toml"
+UA="Research-Radar/1.0"
+RUN_TIMEOUT="${RADAR_TIMEOUT:-300}"
+
+cfg() {  # cfg <dotted.key>  （数组→每行一个）
+  python3 - "$CONFIG" "$1" <<'PY'
+import sys, tomllib
+path, dotted = sys.argv[1], sys.argv[2]
+with open(path, "rb") as f:
+    data = tomllib.load(f)
+cur = data
+for part in dotted.split("."):
+    if not isinstance(cur, dict) or part not in cur:
+        sys.exit(0)
+    cur = cur[part]
+print("\n".join(str(x) for x in cur) if isinstance(cur, list) else cur)
+PY
+}
+ccfg() { "$ROOT/bin/radar-config" "$CONFIG" "$1"; }   # 读 sections
+RADAR_DATE=""
+SYNC_ROOT=""
+die() { echo "[radar] ❌ $*" >&2; notify "生成失败${RADAR_DATE:+（$RADAR_DATE）}：$*"; exit 1; }
+
+# 通知（受 [notify].enabled 控制）
+notify() {
+  case "$(cfg notify.enabled)" in False|false|0|"") return 0;; esac
+  local p=""
+  case "$(cfg notify.persistent)" in True|true|1) p="--persistent";; esac
+  "$ROOT/bin/notify.sh" "Research Radar" "$1" $p >/dev/null 2>&1 || true
+}
+
+# 多机同步（仅当 data/ 是 git 且有 remote；best-effort，失败不阻塞）
+_sync_on() { [ -n "$SYNC_ROOT" ] && [ -d "$SYNC_ROOT/.git" ] && git -C "$SYNC_ROOT" remote 2>/dev/null | grep -q .; }
+# 若 data 仓卡在 rebase 冲突中，先 abort，避免后续 add/commit 行为异常
+_abort_rebase() {
+  { [ -d "$SYNC_ROOT/.git/rebase-merge" ] || [ -d "$SYNC_ROOT/.git/rebase-apply" ]; } || return 0
+  echo "[radar] ⚠️ data 仓卡在 rebase 冲突中，已 abort（保留本地改动）" >&2
+  git -C "$SYNC_ROOT" rebase --abort >/dev/null 2>&1 || true
+}
+sync_pull() {
+  _sync_on || return 0
+  _abort_rebase
+  if ! git -C "$SYNC_ROOT" pull --rebase --autostash >/dev/null 2>&1; then
+    echo "[radar] ⚠️ data 仓 pull 失败（可能冲突），已 abort，本轮不同步，下次再试" >&2
+    _abort_rebase
+  fi
+}
+# 只提交「约定要同步」的数据（白名单），避免 git add -A 把私有/意外文件一并推走
+_sync_paths() {
+  local p
+  for p in digest review \
+           state/seen.jsonl state/curriculum.jsonl state/linux.jsonl \
+           state/feedback.jsonl state/refresh.json state/runs.jsonl \
+           state/sessions .gitignore; do
+    [ -e "$SYNC_ROOT/$p" ] && printf '%s\n' "$p"
+  done
+}
+sync_push() {
+  _sync_on || return 0
+  local paths=() p
+  while IFS= read -r p; do paths+=("$p"); done < <(_sync_paths)
+  [ "${#paths[@]}" -gt 0 ] || return 0
+  git -C "$SYNC_ROOT" add -- "${paths[@]}" >/dev/null 2>&1 || true
+  if git -C "$SYNC_ROOT" diff --cached --quiet; then return 0; fi   # 无暂存改动就不提交
+  git -C "$SYNC_ROOT" -c user.name=radar -c user.email=radar@local commit -q -m "radar: ${RADAR_DATE:-update}" >/dev/null 2>&1 || true
+  git -C "$SYNC_ROOT" push -q >/dev/null 2>&1 || true
+}
+
+# 等网络（最多 ~100s）
+net_wait() {
+  local n=0
+  while [ "$n" -lt 20 ]; do
+    curl -fsS -o /dev/null --max-time 8 "$(cfg source_urls.arxiv_rss)/cs.CL" 2>/dev/null && return 0
+    n=$((n + 1)); sleep 5
+  done
+  return 1
+}
+
+# 等系统时间同步（最多 ~60s；防切系统/时区错位）
+time_wait() {
+  local n=0
+  while [ "$n" -lt 30 ]; do
+    [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ] && return 0
+    n=$((n + 1)); sleep 2
+  done
+  return 1
+}
+
+# 是否需要刷新课程队列（距上次 >= refresh_days 天）
+maybe_refresh() {
+  local rf="$state_dir/refresh.json" days
+  days="$(cfg curriculum.refresh_days)"; days="${days:-7}"
+  python3 - "$rf" "$d" "$days" <<'PY'
+import sys, json, os, datetime
+rf, today, days = sys.argv[1], sys.argv[2], int(sys.argv[3])
+last = ""
+if os.path.exists(rf):
+    try: last = json.load(open(rf)).get("last_refresh", "")
+    except (OSError, ValueError): last = ""
+if not last:
+    print("yes"); sys.exit()
+try:
+    print("yes" if (datetime.date.fromisoformat(today) - datetime.date.fromisoformat(last)).days >= days else "no")
+except ValueError:
+    print("yes")
+PY
+}
+
+usage() {
+  cat <<'EOF'
+用法:
+  radar                         # 直接打开界面（= radar tui）
+  radar run [--date YYYY-MM-DD] [--dry-run] [--no-fetch]
+  radar fb <...>                # 反馈（见下）
+  radar fb item  <like|dislike|learned> <条目ID> [--date D]   # learned=归档课程条目；save 用日报标记
+  radar fb topic <more|less> "<主题>"
+  radar fb mute  "<关键词>"
+  radar fb parse [--date D]     # 解析日报每条末尾的「- **标记**：」行
+  radar fb list [n] / radar fb prefs
+  radar pdf [--date D] [--saved] <条目ID...>   # 下载 PDF（只对 download=true 的栏目）
+  radar tui [--date D]                         # 读日报 + 就地打标（界面）
+  radar refresh [YYYY-MM-DD]                   # 刷新课程队列（归档已学 + 补新）
+  radar review <new|apply> [--date D]          # 生成/应用「复习报告」
+  radar profile <ask|apply> [--date D]         # 画像访谈（模型提问 → 你作答 → 并入 profile.md）
+  run 选项:
+    --date D    指定日期（默认今天）
+    --dry-run   只打印 prompt + 选取结果，不抓取、不调模型、不改状态
+    --no-fetch  跳过抓取，复用 data/state/raw/<date>/ 里已有的数据
+    --force     即使今天已生成也强制重跑
+EOF
+}
+
+# ---------------- 抓取 ----------------
+fetch_arxiv_rss() {
+  local raw="$1" base; base="$(cfg source_urls.arxiv_rss)"; base="${base:-https://rss.arxiv.org/rss}"
+  local cats=(); while IFS= read -r c; do [ -n "$c" ] && cats+=("$c"); done < <(ccfg feed-categories)
+  # 逐类抓取（尊重 arXiv 礼仪，避免并发被限流）
+  for c in "${cats[@]}"; do
+    local out="$raw/arxiv_${c}.xml"
+    if curl -fsSL -A "$UA" --retry 2 --retry-delay 5 --max-time 60 "$base/$c" -o "$out" 2>/dev/null; then
+      echo "[radar]   arXiv RSS $c: $(grep -c '<item>' "$out" 2>/dev/null || echo 0) 条"
+    else echo "[radar]   arXiv RSS $c: 失败" >&2; rm -f "$out"; fi
+    sleep 3
+  done
+}
+fetch_hf() {
+  local raw="$1" url; url="$(cfg source_urls.hf_daily)"
+  curl -fsSL -A "$UA" --retry 2 --retry-delay 2 --max-time 60 "$url" -o "$raw/hf_daily.json" 2>/dev/null \
+    && echo "[radar]   HF Daily: ok" || { echo "[radar]   HF Daily: 失败" >&2; rm -f "$raw/hf_daily.json"; }
+}
+fetch_hn() {
+  local raw="$1" top="$raw/hn_topstories.json"
+  local url base n; url="$(cfg source_urls.hackernews)"; base="$(cfg source_urls.hn_item_base)"; n="$(cfg general.hn_items)"; n="${n:-20}"
+  curl -fsSL -A "$UA" --retry 2 --retry-delay 2 --max-time 40 "$url" -o "$top" 2>/dev/null || { echo "[radar]   HN: 失败" >&2; return 0; }
+  mkdir -p "$raw/hn"
+  python3 - "$top" "$n" > "$raw/hn_ids.txt" <<'PY'
+import json, sys
+ids = json.load(open(sys.argv[1]))
+print("\n".join(str(i) for i in ids[:int(sys.argv[2])]))
+PY
+  xargs -a "$raw/hn_ids.txt" -P 8 -I{} curl -fsSL -A "$UA" --max-time 20 "$base/{}.json" -o "$raw/hn/{}.json" 2>/dev/null || true
+  echo "[radar]   HN: $(ls "$raw/hn" 2>/dev/null | wc -l) 条"
+}
+fetch_rss() {
+  local raw="$1" i=0 url; mkdir -p "$raw/rss"
+  # planet.emacslife 这类聚合源很大很慢（~500KB/~50s），超时给宽一点
+  local rss_timeout="${RADAR_RSS_TIMEOUT:-120}"
+  while IFS= read -r url; do
+    [ -z "$url" ] && continue
+    i=$((i + 1))
+    if curl -fsSL --compressed -A "$UA" --retry 3 --retry-delay 3 --retry-all-errors --max-time "$rss_timeout" "$url" -o "$raw/rss/$i.xml" 2>/dev/null; then
+      echo "[radar]   RSS $i: $(grep -cE '<item>|<entry>' "$raw/rss/$i.xml" 2>/dev/null || echo 0) 条"
+    else echo "[radar]   RSS $i: 失败 $url" >&2; rm -f "$raw/rss/$i.xml"; fi
+    sleep 1
+  done < <(cfg rss.feeds)
+}
+fetch_all() {
+  local raw="$1" sources; sources="$(ccfg feed-sources)"
+  rm -rf "$raw"; mkdir -p "$raw"
+  echo "[radar] 抓取（sources: $(echo $sources | tr '\n' ' ')）→ $raw"
+  local pids=()
+  if echo "$sources" | grep -qx arxiv;      then fetch_arxiv_rss "$raw" & pids+=($!); fi
+  if echo "$sources" | grep -qx hf_daily;   then fetch_hf "$raw"        & pids+=($!); fi
+  if echo "$sources" | grep -qx hackernews; then fetch_hn "$raw"        & pids+=($!); fi
+  if echo "$sources" | grep -qx rss;        then fetch_rss "$raw"       & pids+=($!); fi
+  wait "${pids[@]}" 2>/dev/null || true
+}
+
+# ---------------- 生成 ----------------
+cmd_run() {
+  local force_date="" dry=0 nofetch=0 force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --date)     force_date="${2:-}"; shift 2;;
+      --dry-run)  dry=1; shift;;
+      --no-fetch) nofetch=1; shift;;
+      --force)    force=1; shift;;
+      *) die "未知参数: $1";;
+    esac
+  done
+  [ "$dry" = 1 ] && { export RADAR_DRY=1; nofetch=1; }
+
+  local d="${force_date:-$(date +%F)}"
+  [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "日期格式应为 YYYY-MM-DD: $d"
+  local y="${d%%-*}" mo="${d#*-}"; mo="${mo%%-*}"
+  # 取短主机名：有些系统没装 hostname 命令，退回 uname -n
+  local host; host="$(uname -n 2>/dev/null | cut -d. -f1)"; host="${host:-unknown}"
+
+  local dd dg sd
+  dd="$(cfg general.data_dir)";   dd="${dd:-data}"
+  dg="$(cfg general.digest_dir)"; dg="${dg:-digest}"
+  sd="$(cfg general.state_dir)";  sd="${sd:-state}"
+  local data_root="$ROOT/$dd"
+  local digest_dir="$data_root/$dg" state_dir="$data_root/$sd"
+  raw="$state_dir/raw/$d"
+  local day_dir="$digest_dir/$y/$mo/$d"
+  out="$day_dir/$d.md"
+  mkdir -p "$day_dir"
+
+  RADAR_DATE="$d"; SYNC_ROOT="$data_root"
+
+  # 锁 + 多机拉取 + 幂等 + 网络等待（仅真正运行时）
+  if [ "$dry" != 1 ]; then
+    mkdir -p "$state_dir"
+    exec 9>"$state_dir/.run.lock"
+    if ! flock -n 9; then echo "[radar] 已有一次运行在进行，退出"; exit 0; fi
+    sync_pull            # 多机：先拉，看别的机器是否已生成
+    # 非主生成机：只同步、不生成，避免两台同日各出一份（generate_on 留空=不限制）
+    local gen_on; gen_on="$(cfg general.generate_on || true)"
+    if [ -n "$gen_on" ] && [ "$gen_on" != "$host" ]; then
+      echo "[radar] 本机 '$host' 不是主生成机（generate_on='$gen_on'），已同步后退出"
+      exit 0
+    fi
+    if [ -s "$out" ] && [ "$force" != 1 ]; then
+      echo "[radar] 今天已生成，跳过（--force 可强制重跑）"; exit 0
+    fi
+    net_wait || die "网络不可达（等待超时）"
+    time_wait || die "系统时间未同步（可能切系统/时区导致）；已跳过，避免归档到错误日期。请检查 NTP 或 Windows RTC 设置"
+    if [ "$(maybe_refresh)" = "yes" ]; then
+      echo "[radar] 课程队列需要刷新（每 $(cfg curriculum.refresh_days) 天）…"
+      local rpath
+      rpath="$("$ROOT/bin/radar-review" new "$d" 2>/dev/null | tail -1)"
+      [ -n "$rpath" ] && notify "复习报告已生成 · ${rpath##*/}（radar review apply）"
+      "$ROOT/bin/radar-refresh" "$d" || echo "[radar] ⚠️ 刷新失败，继续生成日报"
+    fi
+  fi
+
+  local proxy; proxy="$(cfg network.proxy || true)"
+  if [ -n "${proxy:-}" ]; then
+    export HTTP_PROXY="$proxy" HTTPS_PROXY="$proxy" http_proxy="$proxy" https_proxy="$proxy"
+    echo "[radar] 使用代理: $proxy"
+  fi
+
+  # 1) 抓取 + 解析候选
+  if [ "$nofetch" = 1 ]; then
+    if [ -f "$raw/candidates.jsonl" ]; then :; 
+    elif [ "$dry" = 1 ]; then mkdir -p "$raw"; : > "$raw/candidates.jsonl";
+    else "$ROOT/bin/radar-extract" "$raw" "$CONFIG" >/dev/null || die "无候选数据: $raw"; fi
+  else
+    fetch_all "$raw"
+    "$ROOT/bin/radar-extract" "$raw" "$CONFIG" || die "解析候选失败"
+  fi
+  echo "[radar] 候选: $(wc -l < "$raw/candidates.jsonl" 2>/dev/null || echo 0) 条"
+
+  # 2) seen 去重
+  local seen="$state_dir/seen.jsonl"; touch "$seen"
+  "$ROOT/bin/radar-state" seen-filter "$raw/candidates.jsonl" "$seen" "$raw/candidates_unseen.jsonl"
+
+  # 3) queue 栏目选条目（间隔重复）
+  local intervals; intervals="$(cfg curriculum.intervals_days | paste -sd, -)"; intervals="${intervals:-1,3,7,16,35}"
+  local sel="{}"
+  while IFS=$'\t' read -r sid smn smx sq; do
+    [ -z "$sid" ] && continue
+    local rows
+    rows="$("$ROOT/bin/radar-state" queue-pick "$data_root/$sq" "${smn:-1}" "${smx:-2}" "$d" "$intervals")"
+    sel="$(python3 -c 'import sys,json;d=json.loads(sys.argv[1]);d[sys.argv[2]]=json.loads(sys.argv[3]);print(json.dumps(d,ensure_ascii=False))' "$sel" "$sid" "$rows")"
+  done < <(ccfg queue-sections)
+
+  if [ "$dry" = 1 ]; then
+    echo "[radar] queue 选取: $(echo "$sel" | python3 -c 'import sys,json;d=json.load(sys.stdin);print({k:[x["topic"] for x in v] for k,v in d.items()})')"
+  else
+    # 美化写入（多行），避免 read 工具按行截断
+    python3 -c 'import sys,json;json.dump(json.loads(sys.argv[2]),open(sys.argv[1],"w",encoding="utf-8"),ensure_ascii=False,indent=1)' "$raw/selected.json" "$sel"
+  fi
+
+  # 4) prompt（按 sections 生成）
+  local prompt
+  prompt="$("$ROOT/bin/radar-prompt" "$CONFIG" "$d" "$out" "$raw/candidates_unseen.jsonl" "$raw/selected.json")"
+
+  if [ "$dry" = 1 ]; then
+    echo "[radar] dry-run —— 输出路径: $out"; echo "----- prompt -----"; echo "$prompt"; return 0
+  fi
+
+  # 5) 模型 fallback（按 [models].order 顺序尝试）；全失败等 5 分钟再试
+  local models=()
+  while IFS= read -r line; do [ -n "$line" ] && models+=("$line"); done < <(cfg models.order)
+  # 本次日报对应的固定 session id：TUI 里按 C 会续这个 session 细聊（上下文都在）
+  # 记录生成它的主机：若日报是别的主机生成并同步过来的，TUI 会改用新对话兜底
+  local sid="ses-radar-$d"
+  mkdir -p "$state_dir/sessions"
+  printf '%s\t%s\n' "$host" "$sid" > "$state_dir/sessions/$d.id"
+
+  local retry_max="${RADAR_RETRIES:-3}" retry_wait="${RADAR_RETRY_WAIT:-300}" attempt=1
+  while :; do
+    for model in "${models[@]}"; do
+      [ -z "$model" ] && continue
+      echo "[radar] 尝试模型: $model（第 $attempt 轮）"
+      if timeout "$RUN_TIMEOUT" opencode run --session "$sid" --title "Research Radar · $d" --model "$model" --auto "$prompt"; then
+        if [ -s "$out" ]; then
+          "$ROOT/bin/radar-state" seen-record "$out" "$seen" "$d" "$host" "$raw/candidates.jsonl" "$CONFIG"
+          echo "[radar] ✅ 生成成功: $out"
+          sync_push
+          notify "$(cfg notify.success_text) · $d"
+          return 0
+        fi
+        echo "[radar] 模型 $model 未产出文件，换下一个"
+      else
+        echo "[radar] 模型 $model 失败/超时，换下一个"
+      fi
+    done
+    if [ "$attempt" -ge "$retry_max" ]; then
+      die "所有模型均失败（已尝试 $attempt 轮）"
+    fi
+    notify "生成失败：${retry_wait}s 后重试（第 $attempt/$retry_max 轮）"
+    echo "[radar] 本轮全失败，等待 ${retry_wait}s 后重试…"
+    sleep "$retry_wait"
+    attempt=$((attempt + 1))
+  done
+}
+
+case "${1:-}" in
+  run)            shift; cmd_run "$@";;
+  fb)             shift; exec "$ROOT/bin/radar-fb" "$@";;
+  pdf)            shift; exec "$ROOT/bin/radar-pdf" "$@";;
+  tui)            shift; exec "$ROOT/bin/radar-tui" "$@";;
+  refresh)        shift; exec "$ROOT/bin/radar-refresh" "$@";;
+  review)         shift; exec "$ROOT/bin/radar-review" "$@";;
+  profile)        shift; exec "$ROOT/bin/radar-profile" "$@";;
+  "")             exec "$ROOT/bin/radar-tui";;
+  -h|--help)      usage;;
+  -*)             cmd_run "$@";;
+  *)              echo "[radar] 未知子命令: $1" >&2; usage; exit 2;;
+esac

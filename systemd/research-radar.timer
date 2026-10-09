@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Research Radar after boot and once daily
+
+[Timer]
+OnBootSec=90s
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

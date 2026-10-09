@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# 课程队列滚动刷新（阶段 6）：归档已学 + 用模型补充新主题。
+# 用法: radar-refresh [YYYY-MM-DD]
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+CONFIG="$ROOT/config.toml"
+RUN_TIMEOUT="${RADAR_TIMEOUT:-300}"
+
+cfg() {
+  python3 - "$CONFIG" "$1" <<'PY'
+import sys, tomllib
+path, dotted = sys.argv[1], sys.argv[2]
+with open(path, "rb") as f:
+    data = tomllib.load(f)
+cur = data
+for part in dotted.split("."):
+    if not isinstance(cur, dict) or part not in cur:
+        sys.exit(0)
+    cur = cur[part]
+print("\n".join(str(x) for x in cur) if isinstance(cur, list) else cur)
+PY
+}
+
+d="${1:-$(date +%F)}"
+dr="$(cfg general.data_dir)";   dr="${dr:-data}"
+sd="$(cfg general.state_dir)";  sd="${sd:-state}"
+after="$(cfg curriculum.learned_after)"; after="${after:-3}"
+add="$(cfg curriculum.add_per_queue)";   add="${add:-5}"
+state="$ROOT/$dr/$sd"
+raw="$state/raw/refresh"; mkdir -p "$raw"
+
+echo "[radar-refresh] 归档已学（times>=$after）…"
+while IFS=$'\t' read -r sid smn smx sq; do
+  [ -z "$sid" ] && continue
+  "$ROOT/bin/radar-curriculum" archive "$ROOT/$dr/$sq" "$after" "$d"
+done < <("$ROOT/bin/radar-config" "$CONFIG" queue-sections)
+
+echo "[radar-refresh] 生成输入…"
+"$ROOT/bin/radar-curriculum" input "$raw/input.json" "$CONFIG" "$d"
+
+cmts="$(python3 - "$state/feedback.jsonl" <<'PY'
+import sys, json, os
+p = sys.argv[1]; out = []
+if os.path.exists(p):
+    for l in open(p, encoding="utf-8"):
+        l = l.strip()
+        if l:
+            r = json.loads(l)
+            if r.get("type") == "comment" and r.get("text"):
+                out.append("- " + (r.get("topic") or r.get("target", "")) + "：" + r["text"])
+print("\n".join(out[-8:]))
+PY
+)"
+profile="$(cat "$ROOT/profile.md" 2>/dev/null || true)"
+
+prompt="$(cat <<EOF
+@curriculum-refresh 刷新课程队列（今天 $d）。
+
+输入：$raw/input.json（各队列现状 + existing_topics）
+输出（用 write 工具精确写到这个路径）：$raw/proposal.json
+
+要求：
+- 对输入里的**每个队列 id**，给出 $add 条**新**主题（不要与 existing_topics 重复）。
+- 文件内容是一个 JSON 对象，结构：
+  {"<队列id>":[{"topic":"...","gist":"1–2句","why":"1句","refs":["URL"],"level":1|2|3}, ...]}
+- level 递进：现有偏基础就补进阶/前沿。
+- **refs 必须是真实、可访问的链接**（官方文档 / man / Arch Wiki / 优质博客或技术文章 / arXiv / 维基）；拿不准就不要写，宁可不给该条。
+- 主题要具体、可学，不要空泛词。
+- 用户复习评语（如有，据此调整新主题方向/难度）：
+$cmts
+- 用户画像（据此定选题方向与难度）：
+$profile
+- 只把 JSON 写到该文件，不要输出别的、不要调用子代理。
+EOF
+)"
+
+models=()
+while IFS= read -r l; do [ -n "$l" ] && models+=("$l"); done < <(cfg models.order)
+ok=0
+for m in "${models[@]}"; do
+  [ -z "$m" ] && continue
+  echo "[radar-refresh] 模型 $m"
+  if timeout "$RUN_TIMEOUT" opencode run --model "$m" --auto "$prompt"; then
+    if [ -s "$raw/proposal.json" ]; then ok=1; break; fi
+  fi
+done
+[ "$ok" = 1 ] || echo "[radar-refresh] ⚠️ 未得到提案，跳过补新"
+
+if "$ROOT/bin/radar-curriculum" apply "$raw/proposal.json" "$CONFIG" "$d"; then
+  python3 -c 'import json,sys;json.dump({"last_refresh":sys.argv[2]},open(sys.argv[1],"w",encoding="utf-8"),ensure_ascii=False)' "$state/refresh.json" "$d"
+  echo "[radar-refresh] ✅ 完成，last_refresh=$d"
+else
+  echo "[radar-refresh] ⚠️ apply 失败，未更新 last_refresh（下次会重试）" >&2
+  exit 1
+fi

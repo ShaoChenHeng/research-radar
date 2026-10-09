@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# 画像访谈：让模型针对当前 profile.md 提问；你作答后并入画像。
+# 用法: radar-profile ask   [--date D]   # 生成访谈问题
+#       radar-profile apply [--date D]   # 把已回答的问题并入 profile.md
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+CONFIG="$ROOT/config.toml"
+RUN_TIMEOUT="${RADAR_TIMEOUT:-300}"
+
+cfg() {
+  python3 - "$CONFIG" "$1" <<'PY'
+import sys, tomllib
+path, dotted = sys.argv[1], sys.argv[2]
+with open(path, "rb") as f:
+    data = tomllib.load(f)
+cur = data
+for part in dotted.split("."):
+    if not isinstance(cur, dict) or part not in cur:
+        sys.exit(0)
+    cur = cur[part]
+print("\n".join(str(x) for x in cur) if isinstance(cur, list) else cur)
+PY
+}
+
+cmd="${1:-}"; shift || true
+date=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --date) date="${2:-}"; shift 2;;
+    *) shift;;
+  esac
+done
+[ -n "$date" ] || date="$(date +%F)"
+
+dr="$(cfg general.data_dir)"; dr="${dr:-data}"
+state="$ROOT/$dr/$(cfg general.state_dir)"
+review="$ROOT/$dr/review"; mkdir -p "$review"
+prof="$ROOT/profile.md"
+out="$review/profile-$date.md"
+
+case "$cmd" in
+  ask)
+    [ -f "$prof" ] || { echo "缺 profile.md"; exit 1; }
+    prompt="$(cat <<EOF
+请阅读「我的画像」文件：$prof
+针对"还缺哪些信息、哪些说法可以更具体"，提出 4–6 个**具体**的中文问题，帮我把画像写得更准。
+（例如：你最想追踪的具体子方向？喜欢综述还是单点方法？每周能投入多少时间？哪些主题要屏蔽？）
+
+用 write 工具精确写到这个路径：$out
+格式：
+# 画像访谈（$date）
+
+1. <问题>
+- **答**：
+
+2. <问题>
+- **答**：
+
+只写这个文件，不要别的，不要调用子代理。
+EOF
+)"
+    models=(); while IFS= read -r l; do [ -n "$l" ] && models+=("$l"); done < <(cfg models.order)
+    for m in "${models[@]}"; do
+      [ -z "$m" ] && continue
+      echo "[radar-profile] 模型 $m"
+      timeout "$RUN_TIMEOUT" opencode run --model "$m" --auto "$prompt" && [ -s "$out" ] && break
+    done
+    [ -s "$out" ] || { echo "未生成问题"; exit 1; }
+    echo "[radar-profile] 访谈问题已生成：$out（作答后运行 radar profile apply）"
+    ;;
+  apply)
+    [ -f "$out" ] || { echo "找不到 $out（先 radar profile ask）" >&2; exit 1; }
+    python3 - "$out" "$prof" "$date" <<'PY'
+import re, sys
+src, prof, date = sys.argv[1], sys.argv[2], sys.argv[3]
+rows, cur = [], ""
+for ln in open(src, encoding="utf-8"):
+    mq = re.match(r"^\s*\d+[.、)]\s*(.+)", ln)
+    if mq:
+        cur = mq.group(1).strip(); continue
+    ma = re.match(r"^\s*[-*]\s*\*\*答\*\*\s*[:：]\s*(.+)$", ln)
+    if ma:
+        a = ma.group(1).strip()
+        if a and not re.match(r"^\d+[.、)]", a):
+            rows.append((cur, a))
+if not rows:
+    print("没有已作答的问题（请在 - **答**： 后填写）"); sys.exit(0)
+with open(prof, "a", encoding="utf-8") as f:
+    f.write(f"\n## 补充（{date}）\n")
+    for q, a in rows:
+        f.write(f"- **{q}**：{a}\n")
+print(f"✓ 已并入 {len(rows)} 条到 {prof}")
+PY
+    ;;
+  *)
+    sed -n '2,4p' "$0"; exit 2;;
+esac

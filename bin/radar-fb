@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Research Radar 反馈工具。
+
+用法:
+  radar-fb item  <like|dislike|learned> <item-id> [--date D]   # 按日报条目反馈/归档（save 用日报标记，不走这里）
+  radar-fb topic <more|less> "<text>"                        # 按主题加/减权
+  radar-fb mute  "<text>"                                    # 屏蔽关键词
+  radar-fb parse [--date D]                                  # 解析日报每条末尾的「- **标记**：」行
+  radar-fb list [n]                                          # 最近 n 条反馈
+  radar-fb prefs                                             # 输出聚合偏好 JSON
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import sys
+import tomllib
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG = os.path.join(ROOT, "config.toml")
+
+
+def load_cfg():
+    return tomllib.load(open(CONFIG, "rb")) if os.path.exists(CONFIG) else {}
+
+
+def data_root(cfg):
+    return os.path.join(ROOT, cfg.get("general", {}).get("data_dir", "data"))
+
+
+def fb_path(cfg):
+    return os.path.join(data_root(cfg), cfg.get("general", {}).get("state_dir", "state"), "feedback.jsonl")
+
+
+def digest_dir(cfg):
+    return os.path.join(data_root(cfg), cfg.get("general", {}).get("digest_dir", "digest"))
+
+
+def host():
+    return os.uname().nodename.split(".")[0]
+
+
+def load_jsonl(path):
+    out = []
+    if os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+def append_fb(cfg, rec):
+    p = fb_path(cfg)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    rec = {"ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), "host": host(), **rec}
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def find_digest(cfg, date):
+    ddir = digest_dir(cfg)
+    if date:
+        y, m, _ = date.split("-")
+        return os.path.join(ddir, y, m, date, f"{date}.md")
+    files = sorted(glob.glob(os.path.join(ddir, "**", "*.md"), recursive=True))
+    return files[-1] if files else ""
+
+
+def section_by_prefix(cfg):
+    return {s.get("prefix"): s for s in cfg.get("sections", [])}
+
+
+def resolve_queue(cfg, item_id, date):
+    """把日报 queue 条目（bN/cN）解析成队列行：返回 (qpath, rows, row) 或 None。"""
+    m = re.match(r"^([A-Za-z]+)(\d+)$", item_id)
+    if not m:
+        return None
+    prefix, num = m.group(1), int(m.group(2))
+    s = section_by_prefix(cfg).get(prefix)
+    if not s or s.get("kind") != "queue":
+        return None
+    droot = data_root(cfg)
+    sd = cfg.get("general", {}).get("state_dir", "state")
+    sel_path = os.path.join(droot, sd, "raw", date, "selected.json")
+    if not os.path.exists(sel_path):
+        return None
+    arr = (json.load(open(sel_path, encoding="utf-8")) or {}).get(s["id"], [])
+    if num - 1 >= len(arr):
+        return None
+    qid = arr[num - 1].get("id")
+    qpath = os.path.join(droot, s["queue"])
+    rows = load_jsonl(qpath)
+    row = next((r for r in rows if r.get("id") == qid), None)
+    return (qpath, rows, row) if row is not None else None
+
+
+def queue_action(cfg, item_id, date, action):
+    """对课程条目执行 action: learned(归档) / confused(尽快再来)。"""
+    r = resolve_queue(cfg, item_id, date)
+    if not r:
+        print(f"{item_id}: 不是可解析的课程条目（需当天 run 过）", file=sys.stderr); return False
+    qpath, rows, row = r
+    if action == "learned":
+        row["status"] = "learned"
+    elif action == "confused":
+        row["due"] = (datetime.date.fromisoformat(date) + datetime.timedelta(days=1)).isoformat()
+    tmp = qpath + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for x in rows:
+            f.write(json.dumps(x, ensure_ascii=False) + "\n")
+    os.replace(tmp, qpath)
+    append_fb(cfg, {"type": action, "target": item_id, "queue_id": row.get("id"),
+                    "topic": row.get("topic", ""), "date": date})
+    note = "归档" if action == "learned" else "尽快再来"
+    print(f"✓ {action}（{note}）：{item_id} → {row.get('id')} {row.get('topic', '')}")
+    return True
+
+
+def feed_keywords(cfg):
+    kws = []
+    for s in cfg.get("sections", []):
+        if s.get("kind") == "feed":
+            kws += s.get("keywords", [])
+    return kws
+
+
+def section_items(text):
+    """把日报拆成 [{id, prefix, title, body}]。"""
+    items = []
+    for m in re.finditer(r"^###\s*\[([A-Za-z]+)(\d+)\]\s*(.+?)\s*$(.*?)(?=^###\s*\[|^##\s|\Z)", text, re.S | re.M):
+        items.append({"prefix": m.group(1), "num": int(m.group(2)), "title": m.group(3).strip(), "body": m.group(4)})
+    return items
+
+
+def cmd_item(cfg, argv):
+    signal, item_id = argv[0], argv[1]
+    date = ""
+    if len(argv) > 2 and argv[2] == "--date":
+        date = argv[3]
+    sl = signal.lower()
+    dg = find_digest(cfg, date)
+    d = date or (os.path.basename(dg)[:-3] if dg else "")
+    if sl in LEARN_TOKENS:
+        return 0 if queue_action(cfg, item_id, d, "learned") else 1
+    if sl in CONFUSED_TOKENS:
+        return 0 if queue_action(cfg, item_id, d, "confused") else 1
+    if sl not in ("like", "dislike"):
+        if sl == "save":
+            print("save 只用于下载（radar pdf --saved），不记入反馈；请在日报里标 save。", file=sys.stderr)
+        else:
+            print(f"未知信号：{signal}（like/dislike=反馈；learned=归档；confused=没懂）", file=sys.stderr)
+        return 2
+    text = open(dg, encoding="utf-8").read() if dg and os.path.exists(dg) else ""
+    m = re.match(r"^([A-Za-z]+)(\d+)$", item_id)
+    if not m:
+        print(f"条目 ID 形如 a1/b2/c3，收到: {item_id}", file=sys.stderr); return 2
+    prefix, num = m.group(1), int(m.group(2))
+    it = next((x for x in section_items(text) if x["prefix"] == prefix and x["num"] == num), None)
+    if it is None:
+        print(f"在 {dg or '（无日报）'} 里找不到条目 {item_id}", file=sys.stderr); return 1
+    blob = (it["title"] + " " + it["body"]).lower()
+    topics = [k for k in feed_keywords(cfg) if k.lower() in blob]
+    if not topics:
+        topics = [it["title"]]
+    append_fb(cfg, {"type": "item", "target": item_id, "signal": signal,
+                    "topics": topics, "title": it["title"],
+                    "date": os.path.basename(dg)[:-3] if dg else date})
+    print(f"✓ {signal} {item_id}（主题: {', '.join(topics)}）")
+    return 0
+
+
+def cmd_topic(cfg, argv):
+    signal, text = argv[0], " ".join(argv[1:])
+    append_fb(cfg, {"type": "topic", "target": text, "signal": signal})
+    print(f"✓ {signal} 主题 “{text}”")
+    return 0
+
+
+def cmd_mute(cfg, argv):
+    text = " ".join(argv)
+    append_fb(cfg, {"type": "mute", "target": text})
+    print(f"✓ 屏蔽 “{text}”")
+    return 0
+
+
+MARK_RE = re.compile(r"^\s*[-*]\s*\*\*标记\*\*\s*[:：]\s*(.*)$", re.M)
+SEP = re.compile(r"[\s,，、/]+")
+# 只有 like/dislike 算反馈；save 只是「下载」标记（由 radar pdf --saved 读日报标记）
+PARSE_SIGNALS = {"like": "like", "喜欢": "like", "赞": "like",
+                 "dislike": "dislike", "不喜欢": "dislike", "踩": "dislike"}
+# 课程条目标记：learned=归档；confused=没懂→尽快再来
+LEARN_TOKENS = {"learned", "done", "会了", "掌握", "学完"}
+CONFUSED_TOKENS = {"confused", "again", "没懂", "不懂", "看不懂"}
+
+
+def cmd_parse(cfg, argv):
+    date = ""
+    if "--date" in argv:
+        date = argv[argv.index("--date") + 1]
+    dg = find_digest(cfg, date)
+    if not dg or not os.path.exists(dg):
+        print("找不到日报", file=sys.stderr); return 1
+    text = open(dg, encoding="utf-8").read()
+    n = 0
+    for it in section_items(text):
+        m = MARK_RE.search(it["body"])
+        if not m:
+            continue
+        # 一行可写多个信号（空格/逗号分隔）：like/dislike 进反馈；learned 归档；save 只下载
+        toks = [x for x in SEP.split(m.group(1).strip().lower()) if x]
+        learned = any(t in LEARN_TOKENS for t in toks)
+        confused = any(t in CONFUSED_TOKENS for t in toks)
+        sigs = []
+        for t in toks:
+            s = PARSE_SIGNALS.get(t)
+            if s and s not in sigs:
+                sigs.append(s)
+        if not sigs and not learned and not confused:
+            continue
+        dstr = os.path.basename(dg)[:-3]
+        ikey = f"{it['prefix']}{it['num']}"
+        blob = (it["title"] + " " + it["body"]).lower()
+        topics = [k for k in feed_keywords(cfg) if k.lower() in blob] or [it["title"]]
+        if learned:
+            queue_action(cfg, ikey, dstr, "learned"); n += 1
+        if confused:
+            # queue → 尽快再来；feed → 太难/看不懂（记反馈，视为少推）
+            if queue_action(cfg, ikey, dstr, "confused"):
+                n += 1
+            else:
+                append_fb(cfg, {"type": "item", "target": ikey, "signal": "confused",
+                                "topics": topics, "title": it["title"], "date": dstr})
+                n += 1
+        for sig in sigs:
+            append_fb(cfg, {"type": "item", "target": ikey, "signal": sig,
+                            "topics": topics, "title": it["title"], "date": dstr})
+            n += 1
+    print(f"✓ 解析完成，记录 {n} 条（like/dislike 反馈；learned 归档；confused 没懂；save 只下载）")
+    return 0
+
+
+def cmd_list(cfg, argv):
+    n = int(argv[0]) if argv else 20
+    rows = load_jsonl(fb_path(cfg))
+    for r in rows[-n:]:
+        t = r.get("target", "")
+        print(f"  {r.get('ts','')}  {r.get('type')}/{r.get('signal','')}  {t}")
+    if not rows:
+        print("  （暂无反馈）")
+    return 0
+
+
+def compute_prefs(cfg):
+    mute, boost = [], {}
+    for r in load_jsonl(fb_path(cfg)):
+        typ, tgt, sig = r.get("type"), str(r.get("target", "")).lower(), r.get("signal")
+        if typ == "mute" and tgt:
+            mute.append(tgt)
+        elif typ == "topic" and tgt:
+            boost[tgt] = boost.get(tgt, 0) + (1 if sig == "more" else -1)
+        elif typ == "item":
+            if sig not in ("like", "dislike", "confused"):
+                continue
+            w = 1 if sig == "like" else -1
+            for t in r.get("topics", []):
+                k = str(t).lower()
+                if k:
+                    boost[k] = boost.get(k, 0) + w
+    return {"mute": sorted(set(mute)), "boost": boost}
+
+
+def cmd_prefs(cfg, argv):
+    print(json.dumps(compute_prefs(cfg), ensure_ascii=False))
+    return 0
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__); return 2
+    cfg = load_cfg()
+    cmd, argv = sys.argv[1], sys.argv[2:]
+    table = {"item": cmd_item, "topic": cmd_topic, "mute": cmd_mute,
+             "parse": cmd_parse, "list": cmd_list, "prefs": cmd_prefs}
+    if cmd not in table:
+        print(f"未知子命令: {cmd}\n{__doc__}"); return 2
+    return table[cmd](cfg, argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

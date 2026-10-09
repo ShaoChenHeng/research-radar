@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""Research Radar TUI —— 单栏读日报（渲染后）；光标到「标记」行弹候选，到链接行提示。
+curses，标准库，无依赖。
+
+用法: radar-tui [--date YYYY-MM-DD] [--dump]
+按键:  j/k 或 C-n/C-p 逐行 · C-v/M-v 翻页 · M-< / M-> 首尾 · [ / ] 前一天/后一天
+       H 打开「历史日报」选择器 · 到「标记：」行弹候选（l/d/c/s/e 或数字）
+       到含网址的行 → Enter 打开（并把浏览器置顶）· Y 复制链接 · C 细聊（续日报 session）
+       a 应用 · g 重新读取文件 · o 打开文件夹 · ? 帮助 · q 退出
+"""
+import curses
+import glob
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import unicodedata
+
+BROWSER_CLASSES = ["chrome", "chromium", "firefox", "brave", "vivaldi", "edge",
+                   "falkon", "konqueror", "opera", "epiphany", "librewolf",
+                   "waterfox", "qutebrowser"]
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG = os.path.join(ROOT, "config.toml")
+FEED_MARKS = [("l", "like"), ("d", "dislike"), ("c", "confused"), ("s", "save")]
+QUEUE_MARKS = [("l", "like"), ("d", "dislike"), ("c", "confused"), ("e", "learned")]
+MD_TOKEN = re.compile(r"^(- \*\*标记\*\*：)\s*(.*)$")
+ITEM_RE = re.compile(r"^###\s*\[([A-Za-z]+)(\d+)\]\s*(.*)$")
+LINK_RE = re.compile(r"\]\((https?://[^)]+)\)")
+URL_RE = re.compile(r"https?://[^\s)）]+")
+BOLD_FIELD = re.compile(r"^- \*\*(.+?)\*\*：\s*(.*)$")
+
+
+def cw(ch):
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def swidth(s):
+    return sum(cw(c) for c in s)
+
+
+def fit(s, w):
+    out, n = [], 0
+    for c in s:
+        if n + cw(c) > w:
+            break
+        out.append(c); n += cw(c)
+    return "".join(out)
+
+
+def wrap(s, w):
+    s = s.replace("\t", "    ")
+    if not s:
+        return [""]
+    out, cur, n = [], "", 0
+    for c in s:
+        if n + cw(c) > w and cur:
+            out.append(cur); cur, n = c, cw(c)
+        else:
+            cur += c; n += cw(c)
+    out.append(cur)
+    return out
+
+
+def have(c):
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        if os.path.exists(os.path.join(p, c)):
+            return os.path.join(p, c)
+    return ""
+
+
+# 日报由别的主机生成、本机还没有对应 session 时，用来开场的预制 prompt
+CHAT_OPENER = ("请通读今天的日报，结合我的 profile.md，挑 2–3 条最值得我深入的讲讲，"
+               "说清为什么值得看、我该怎么用；再补充一两处你觉得有趣或反直觉的点。")
+
+
+def chat_context(digest_path):
+    try:
+        rel = os.path.relpath(digest_path, ROOT)
+    except ValueError:
+        rel = digest_path
+    return f"背景：我在用 Research Radar，今天的日报在 {rel}，请先读它。\n"
+
+
+def state_dir(cfg):
+    g = cfg.get("general", {})
+    return os.path.join(ROOT, g.get("data_dir", "data"), g.get("state_dir", "state"))
+
+
+def load_cfg():
+    return tomllib.load(open(CONFIG, "rb")) if os.path.exists(CONFIG) else {}
+
+
+def digest_dir(cfg):
+    return os.path.join(ROOT, cfg.get("general", {}).get("data_dir", "data"),
+                        cfg.get("general", {}).get("digest_dir", "digest"))
+
+
+def all_digests(cfg):
+    return sorted(glob.glob(os.path.join(digest_dir(cfg), "**", "*.md"), recursive=True))
+
+
+def find_digest(cfg, date):
+    fs = all_digests(cfg)
+    if date:
+        for f in fs:
+            if os.path.basename(f) == f"{date}.md":
+                return f
+        y, m, _ = date.split("-")
+        return os.path.join(digest_dir(cfg), y, m, date, f"{date}.md")
+    return fs[-1] if fs else ""
+
+
+def queue_prefixes(cfg):
+    return {s.get("prefix") for s in cfg.get("sections", []) if s.get("kind") == "queue"}
+
+
+def marks_for(prefix, qpre):
+    return QUEUE_MARKS if prefix in qpre else FEED_MARKS
+
+
+def openers():
+    out = []
+    for c, pre in (("xdg-open", []), ("gio", ["open"])):
+        p = have(c)
+        if p:
+            out.append([p, *pre])
+    return out
+
+
+def url_hint(url):
+    """从链接里取一个用于匹配窗口标题的线索（arXiv 编号最好用）。"""
+    m = re.search(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"(\d{4}\.\d{4,5})(?:v\d+)?(?:\.pdf)?$", url)
+    return m.group(1) if m else ""
+
+
+def raise_script(hint, classes, mode="same-screen"):
+    """生成 KWin 脚本：把浏览器窗口置顶，且尽量不改动当前桌面/活动/屏幕。"""
+    cls = ",".join(json.dumps(c) for c in classes)
+    return f"""var HINT = {json.dumps(hint)};
+var CLASSES = [{cls}];
+var MODE = {json.dumps(mode)};
+var ws = workspace.windowList();
+var activeOutput = null;
+try {{ activeOutput = workspace.activeWindow ? workspace.activeWindow.output : null; }} catch (e) {{}}
+var sameMatch = null, sameAny = null, anyMatch = null, anyAny = null;
+for (var i = 0; i < ws.length; i++) {{
+  var w = ws[i];
+  var rc = (w.resourceClass || "").toString().toLowerCase();
+  var hit = false;
+  for (var j = 0; j < CLASSES.length; j++) {{
+    if (rc.indexOf(CLASSES[j]) >= 0) {{ hit = true; break; }}
+  }}
+  if (!hit) continue;
+  var onCur = false;
+  try {{ onCur = !!(activeOutput && w.output === activeOutput); }} catch (e) {{}}
+  var isMatch = !!(HINT && (w.caption || "").toString().indexOf(HINT) >= 0);
+  if (!anyAny) anyAny = w;
+  if (isMatch && !anyMatch) anyMatch = w;
+  if (onCur) {{
+    if (!sameAny) sameAny = w;
+    if (isMatch && !sameMatch) sameMatch = w;
+  }}
+}}
+var target = null;
+if (MODE === "same-screen") {{
+  target = sameMatch || sameAny;                 // 只在“当前屏幕”置顶，绝不切屏
+}} else {{
+  target = sameMatch || anyMatch || sameAny || anyAny;
+}}
+if (target) {{
+  if (target.minimized) target.minimized = false;
+  try {{ target.desktops = [workspace.currentDesktop]; }} catch (e) {{}}
+  try {{ target.activities = [workspace.currentActivity]; }} catch (e) {{}}
+  workspace.activeWindow = target;
+}}
+"""
+
+
+# ---------- 数据 ----------
+def parse(lines):
+    secs, sec, item = [], None, None
+    for i, ln in enumerate(lines):
+        if ln.startswith("## "):
+            sec = {"title": ln[3:].strip(), "items": []}; secs.append(sec); item = None
+        elif ln.startswith("### "):
+            m = ITEM_RE.match(ln)
+            if m and sec is not None:
+                if sec["items"]:
+                    sec["items"][-1]["end"] = i
+                item = {"prefix": m.group(1), "num": int(m.group(2)), "title": m.group(3).strip(),
+                        "head": i, "mark": None, "end": len(lines)}
+                sec["items"].append(item)
+        elif item is not None and MD_TOKEN.match(ln):
+            item["mark"] = i
+    return secs
+
+
+def all_items(secs):
+    return [it for s in secs for it in s["items"]]
+
+
+def tokens_of(lines, item):
+    if item["mark"] is None:
+        return []
+    m = MD_TOKEN.match(lines[item["mark"]])
+    return m.group(2).split() if m else []
+
+
+def set_mark(lines, item, token):
+    toks = tokens_of(lines, item)
+    toks = [t for t in toks if t != token] if token in toks else toks + [token]
+    nl = f"- **标记**：{' '.join(toks)}"
+    out = list(lines)
+    if item["mark"] is not None:
+        out[item["mark"]] = nl
+    else:
+        out.insert(item["end"], nl)
+    return out
+
+
+def item_link(lines, item):
+    for ln in lines[item["head"]:item["end"]]:
+        m = LINK_RE.search(ln)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def strip_md(s):
+    return re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+
+
+def render(ln):
+    if ln.startswith("## "):
+        return "▌ " + strip_md(ln[3:].strip()), "h1"
+    if ln.startswith("### "):
+        return strip_md(ln[4:].strip()), "h2"
+    m = MD_TOKEN.match(ln)
+    if m:
+        return "标记：" + m.group(2), "mark"
+    m = BOLD_FIELD.match(ln)
+    txt = ("• " + m.group(1) + "：" + m.group(2)) if m else ln
+    txt = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", lambda x: f"{x.group(1)}  {x.group(2)}", txt)
+    return strip_md(txt), "text"
+
+
+def write_file(path, lines):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+# ---------- UI ----------
+class App:
+    def __init__(self, scr, path):
+        self.scr = scr
+        self.cfg = load_cfg()
+        self.qpre = queue_prefixes(self.cfg)
+        self.files = all_digests(self.cfg)
+        self.path = path
+        self.di = self.files.index(path) if path in self.files else len(self.files) - 1
+        self.ops = openers()
+        self.wl = have("wl-copy")
+        self.qdbus = have("qdbus6") or have("qdbus")
+        b = self.cfg.get("general", {}).get("browser", "")
+        self.browser_classes = [b] if b else BROWSER_CLASSES
+        self.init_colors()
+        self.load()
+
+    def init_colors(self):
+        self.C = {"h1": curses.A_BOLD, "h2": curses.A_BOLD, "mark": curses.A_BOLD, "link": 0}
+        try:
+            curses.start_color(); curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)
+            curses.init_pair(3, curses.COLOR_GREEN, -1)
+            curses.init_pair(4, curses.COLOR_MAGENTA, -1)
+            self.C = {"h1": curses.color_pair(1) | curses.A_BOLD, "h2": curses.color_pair(2) | curses.A_BOLD,
+                      "mark": curses.color_pair(3) | curses.A_BOLD, "link": curses.color_pair(4)}
+        except curses.error:
+            pass
+
+    def load(self):
+        self.cursor = 0; self.scroll = 0; self.msg = ""
+        self.help = False; self.picker = False
+        self.pick_sel = self.di
+        self.lines = open(self.path, encoding="utf-8").read().rstrip().split("\n")
+        self.secs = parse(self.lines)
+        self.items = all_items(self.secs)
+        self.rebuild()
+
+    def rebuild(self):
+        w = max(20, self.scr.getmaxyx()[1] - 2)
+        src_item = [None] * len(self.lines)
+        for it in self.items:
+            for i in range(it["head"], min(it["end"], len(src_item))):
+                src_item[i] = it
+        self.dlines = []
+        for i, ln in enumerate(self.lines):
+            text, kind = render(ln)
+            m = URL_RE.search(ln)
+            url = m.group(0) if (m and kind != "mark") else ""
+            for c in wrap(text, w):
+                self.dlines.append({"text": c, "src": i, "kind": kind, "item": src_item[i], "url": url})
+        # 末尾留一个空行：光标可以移到这里停住，且能看见高亮
+        self.dlines.append({"text": "", "src": len(self.lines), "kind": "blank", "item": None, "url": ""})
+
+    def cur(self):
+        return self.dlines[self.cursor] if self.dlines else None
+
+    def goto_src(self, src):
+        for i, d in enumerate(self.dlines):
+            if d["src"] == src:
+                self.cursor = i; return
+
+    def save_lines(self, lines, src):
+        write_file(self.path, lines); self.load(); self.goto_src(src)
+
+    def switch_day(self, d):
+        nd = self.di + d
+        if 0 <= nd < len(self.files):
+            self.path = self.files[nd]; self.di = nd; self.load()
+            self.msg = f"→ {os.path.basename(self.path)[:-3]}"
+        else:
+            self.msg = "没有更" + ("早" if d < 0 else "新") + "的日报了"
+
+    def resize(self):
+        cur = self.cur()
+        src = cur["src"] if cur else 0
+        self.rebuild()
+        self.goto_src(src)
+        self.cursor = max(0, min(self.cursor, max(0, len(self.dlines) - 1)))
+
+    def put(self, y, x, s, attr=0):
+        H, W = self.scr.getmaxyx()
+        if y < 0 or y >= H or x >= W:
+            return
+        try:
+            self.scr.addstr(y, x, fit(s, W - x - 1), attr)
+        except curses.error:
+            pass
+
+    def draw(self):
+        self.scr.erase()
+        H, W = self.scr.getmaxyx()
+        top, bot = 1, H - 2
+        view = bot - top
+        name = f" Research Radar · {os.path.basename(self.path)[:-3]}  ({self.di + 1}/{len(self.files)}) "
+        self.put(0, 0, name + " " * max(0, W - 1 - swidth(name)), curses.A_REVERSE)
+        if self.cursor < self.scroll:
+            self.scroll = self.cursor
+        if self.cursor >= self.scroll + view:
+            self.scroll = self.cursor - view + 1
+        self.scroll = max(0, min(self.scroll, max(0, len(self.dlines) - view)))
+        for n in range(view):
+            i = self.scroll + n
+            if i >= len(self.dlines):
+                break
+            d = self.dlines[i]
+            if i == self.cursor:
+                # 当前行：整行反白（空行也看得见光标在哪）
+                self.put(top + n, 1, d["text"] + " " * max(0, W - 2 - swidth(d["text"])), curses.A_REVERSE)
+                continue
+            attr = self.C.get(d["kind"], 0)
+            if d["kind"] == "text" and d["url"]:
+                attr = self.C["link"]
+            self.put(top + n, 1, d["text"], attr)
+        cur = self.cur()
+        if cur and cur["kind"] == "mark" and cur["item"]:
+            self.draw_marks(top + (self.cursor - self.scroll), W, cur["item"])
+        # 状态行
+        if self.msg:
+            status = self.msg
+        elif cur and cur["url"]:
+            status = "Enter 打开链接（浏览器自动置顶）  ·  Y 复制链接"
+        else:
+            status = ""
+        self.put(H - 2, 0, " " + status + " " * max(0, W - 1 - swidth(status) - 1), curses.A_REVERSE)
+        self.put(H - 1, 0, " j/k 移动 · C-v 翻页 · [ ] 切天 · H 历史 · C 对话 · Enter 开链接 · a 应用 · ? 帮助 · q 退出", curses.A_DIM)
+        if self.picker:
+            self.draw_picker(H, W)
+        elif self.help:
+            self.draw_help(H, W)
+        self.scr.refresh()
+
+    def _overlay(self, rows, title, H, W, sel=None, top=0):
+        body = rows[top:]
+        w = max([swidth(title), *[swidth(r) for r in rows]]) + 4
+        w = min(w, W - 4)
+        h = min(len(body), H - 6)
+        y0 = max(1, (H - h - 2) // 2); x0 = max(0, (W - w) // 2)
+        for i in range(h + 2):
+            self.put(y0 + i, x0, " " * w, curses.A_REVERSE)
+        self.put(y0, x0 + 2, fit(" " + title, w - 3), curses.A_REVERSE | curses.A_BOLD)
+        for i in range(h):
+            r = body[i]
+            attr = curses.A_REVERSE | (curses.A_BOLD if sel == top + i else 0)
+            self.put(y0 + 1 + i, x0 + 1, " " + fit(r, w - 3) + " " * max(0, w - 3 - swidth(r)), attr)
+
+    def draw_marks(self, cy, W, item):
+        cands = marks_for(item["prefix"], self.qpre)
+        toks = tokens_of(self.lines, item)
+        rows = [f"{i + 1} {tok}" + ("  ✓" if tok in toks else "") for i, (k, tok) in enumerate(cands)]
+        title = f"标记 [{item['prefix']}{item['num']}]"
+        w = max([swidth(title), *[swidth(r) for r in rows]]) + 4
+        H = self.scr.getmaxyx()[0]
+        y0 = cy + 1
+        if y0 + len(rows) + 2 >= H - 2:
+            y0 = max(1, cy - len(rows) - 2)
+        x0 = min(W - w - 1, 3)
+        for i in range(len(rows) + 2):
+            self.put(y0 + i, x0, " " * w, curses.A_REVERSE)
+        self.put(y0, x0 + 1, title, curses.A_REVERSE | curses.A_BOLD)
+        for i, r in enumerate(rows):
+            self.put(y0 + 1 + i, x0 + 2, r + " " * max(0, w - 4 - swidth(r)), curses.A_REVERSE)
+
+    def draw_picker(self, H, W):
+        rows = [os.path.basename(f)[:-3] for f in self.files]
+        h = min(len(rows), H - 6)
+        start = max(0, self.pick_sel - h + 1) if self.pick_sel >= h else 0
+        self._overlay(rows, "历史日报（Enter 打开）", H, W, sel=self.pick_sel, top=start)
+
+    def draw_help(self, H, W):
+        rows = [
+            "j / k 或 C-n / C-p   逐行移动        C-v / M-v  翻页        M-< / M->  首 / 尾",
+            "[ / ]                前一天 / 后一天日报        H  历史日报选择器",
+            "到「标记：」行 → 弹候选：l 喜欢  d 不喜欢  c 看不懂  s 收藏  e 学会(课程)（或按数字）",
+            "到含网址的行 → Enter 打开（先落到当前屏幕的浏览器并置顶，不切屏）  ·  Y 复制链接",
+            "C  细聊：续今日日报 session（它读过全部候选 → 可追问未入选的条目）",
+            "g  重新读取文件（外部改动后）        a  应用标记（radar fb parse）",
+            "o  打开当天文件夹                    ?  帮助        q  退出",
+        ]
+        self._overlay(rows, "帮助", H, W)
+
+    def open_url(self, url):
+        if not url:
+            self.msg = "这条没有链接"; return
+        if not self.ops:
+            self.msg = "找不到打开器（xdg-open）"; return
+        for op in self.ops:
+            try:
+                p = subprocess.Popen(op + [url], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    p.communicate(timeout=6)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                if p.returncode in (0, None):
+                    self.msg = "已打开：" + url; return
+            except OSError:
+                pass
+        self.msg = "打开失败（可复制链接）：" + url
+
+    def raise_window(self, hint):
+        """用 KWin 脚本把浏览器窗口拉到最前（Wayland 下唯一可靠的方式）。"""
+        if not self.qdbus:
+            return
+        path = os.path.join(tempfile.gettempdir(), "radar-raise.js")
+        devnull = subprocess.DEVNULL
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(raise_script(hint, self.browser_classes))
+            subprocess.run([self.qdbus, "org.kde.KWin", "/Scripting",
+                            "org.kde.kwin.Scripting.loadScript", path, "radarraise"],
+                           stdout=devnull, stderr=devnull, timeout=5)
+            subprocess.run([self.qdbus, "org.kde.KWin", "/Scripting",
+                            "org.kde.kwin.Scripting.start"],
+                           stdout=devnull, stderr=devnull, timeout=5)
+            time.sleep(0.25)
+            subprocess.run([self.qdbus, "org.kde.KWin", "/Scripting",
+                            "org.kde.kwin.Scripting.unloadScript", "radarraise"],
+                           stdout=devnull, stderr=devnull, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def open_and_raise(self, url):
+        # 1) 先激活“当前屏幕”的浏览器窗口，让 Chrome 把新标签开在这一屏（不切屏）
+        self.raise_window("")
+        time.sleep(0.15)
+        # 2) 打开链接
+        self.open_url(url)
+        if not self.msg.startswith("已打开"):
+            return
+        # 3) 再置顶：arXiv 链接按编号精确匹配到新标签所在的窗口
+        time.sleep(0.7)
+        self.raise_window(url_hint(url))
+
+    def session_for(self, path):
+        """返回 (session_id, is_fallback)。
+
+        规则：优先用「本机生成今天日报」的那个 session；若日报是别的主机生成、
+        或没有记录，则用本机固定的兜底 session（ses-radar-local-<日期>）——
+        它由 opencode「不存在就创建」，所以后续每次 C 都会续同一个。
+        is_fallback=True 表示本机还没建过、需要带上日报上下文。
+        """
+        date = os.path.basename(path)[:-3]
+        host = socket.gethostname().split(".")[0].lower()
+        f = os.path.join(state_dir(self.cfg), "sessions", date + ".id")
+        try:
+            parts = open(f, encoding="utf-8").read().strip().split("\t")
+        except OSError:
+            parts = []
+        if len(parts) == 2:
+            if parts[0].split(".")[0].lower() == host and parts[1].startswith("ses"):
+                return parts[1], False        # 本机生成的日报 session
+            # 记录显示是别的主机生成 → 直接用本机固定兜底，不再猜
+            return self._local_session(date)
+        if len(parts) == 1 and parts[0].startswith("ses"):
+            return parts[0], False
+        # 没有记录（老日报）：本机若有同日期的日报 session 就续它，否则兜底
+        sid = self._find_local_digest_session(date)
+        return (sid, False) if sid else self._local_session(date)
+
+    def _local_session(self, date):
+        """本机固定兜底 session：不存在由 opencode 创建，存在就续 → 后续每次都同一个。"""
+        local = f"ses-radar-local-{date}"
+        return (local, False) if self._has_session(local) else (local, True)
+
+    def _session_lines(self):
+        op = have("opencode")
+        if not op:
+            return []
+        try:
+            r = subprocess.run([op, "session", "list"], cwd=ROOT,
+                               capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        return (r.stdout or "").splitlines()
+
+    def _has_session(self, sid):
+        return any(ln.split("\t")[0].strip() == sid for ln in self._session_lines() if ln.strip())
+
+    def _find_local_digest_session(self, date):
+        for ln in self._session_lines():
+            cols = ln.split("\t")
+            if (len(cols) >= 2 and date in cols[1]
+                    and ("Radar" in cols[1] or "日报" in cols[1])
+                    and cols[0].strip().startswith("ses")):
+                return cols[0].strip()
+        return ""
+
+    def chat(self):
+        """进入 opencode 细聊：续「生成今天日报的那个 session」（直接进对话，不弹窗）。
+        若日报是别的主机生成、本机还没有 session，则用本机固定兜底 session + 预制 prompt 开场。"""
+        op = have("opencode")
+        if not op:
+            self.msg = "找不到 opencode"
+            return
+        sid, fallback = self.session_for(self.path)
+        cmd = [op, ROOT, "--session", sid]
+        if fallback:                          # 本机首次 → 用预制 prompt 开场（之后每次直接续）
+            cmd += ["--prompt", chat_context(self.path) + CHAT_OPENER]
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            subprocess.run(cmd, cwd=ROOT)
+        except OSError:
+            pass
+        curses.reset_prog_mode()
+        self.scr.clear()
+        self.scr.refresh()
+
+    def copy_url(self, url):
+        if not url:
+            self.msg = "这条没有链接"; return
+        if not self.wl:
+            self.msg = "没装 wl-copy，无法复制"; return
+        try:
+            subprocess.run([self.wl], input=url, text=True, timeout=5)
+            self.msg = "已复制链接：" + url
+        except (OSError, subprocess.SubprocessError):
+            self.msg = "复制失败"
+
+    def pick(self, item, tok):
+        src = item["mark"] if item["mark"] is not None else item["end"]
+        self.save_lines(set_mark(self.lines, item, tok), src)
+        self.msg = f"{item['prefix']}{item['num']} 标记 {tok}（按 a 应用）"
+
+    def m_prefix(self):
+        self.scr.timeout(60); nxt = self.scr.getch(); self.scr.timeout(-1)
+        if nxt == ord("<"):
+            self.cursor = 0
+        elif nxt == ord(">"):
+            self.cursor = max(0, len(self.dlines) - 1)
+        elif nxt == ord("v"):
+            self.cursor = max(0, self.cursor - 10)
+
+    def run(self):
+        curses.curs_set(0); self.scr.keypad(True)
+        while True:
+            self.draw()
+            ch = self.scr.getch()
+            # 窗口缩放 → 按新宽度重新换行
+            if ch == curses.KEY_RESIZE:
+                self.resize()
+                continue
+            # 模态：历史选择器
+            if self.picker:
+                if ch in (27, ord("q"), ord("Q")):
+                    self.picker = False
+                elif ch in (curses.KEY_DOWN, ord("j"), 14):
+                    self.pick_sel = min(len(self.files) - 1, self.pick_sel + 1)
+                elif ch in (curses.KEY_UP, ord("k"), 16):
+                    self.pick_sel = max(0, self.pick_sel - 1)
+                elif ch in (curses.KEY_ENTER, 10, 13):
+                    self.path = self.files[self.pick_sel]; self.di = self.pick_sel; self.load()
+                    self.msg = f"→ {os.path.basename(self.path)[:-3]}"
+                continue
+            # 常规
+            if ch in (ord("q"), ord("Q")):
+                return
+            if ch == 27:
+                self.m_prefix(); continue
+            if ch == ord("?"):
+                self.help = not self.help; continue
+            if self.help:
+                self.help = False; continue
+            if ch == ord("H"):
+                self.picker = True; self.pick_sel = self.di; continue
+            if ch == ord("C"):
+                self.chat(); continue
+            if ch in (curses.KEY_DOWN, ord("j"), 14):
+                self.cursor = min(len(self.dlines) - 1, self.cursor + 1); self.msg = ""
+            elif ch in (curses.KEY_UP, ord("k"), 16):
+                self.cursor = max(0, self.cursor - 1); self.msg = ""
+            elif ch in (curses.KEY_NPAGE, 22):
+                self.cursor = min(len(self.dlines) - 1, self.cursor + 10)
+            elif ch == curses.KEY_PPAGE:
+                self.cursor = max(0, self.cursor - 10)
+            elif ch == ord("]"):
+                self.switch_day(1)
+            elif ch == ord("["):
+                self.switch_day(-1)
+            elif ch == ord("g"):
+                self.load(); self.msg = "已重新读取文件"
+            elif ch == ord("a"):
+                r = subprocess.run([os.path.join(ROOT, "bin", "radar-fb"), "parse"],
+                                   capture_output=True, text=True)
+                o = (r.stdout or r.stderr).strip().splitlines()
+                self.msg = o[-1] if o else "已应用"
+            elif ch == ord("o"):
+                self.open_url(os.path.dirname(self.path))
+            elif ch == ord("Y"):
+                cur = self.cur()
+                self.copy_url(cur["url"] if cur and cur["url"] else (item_link(self.lines, cur["item"]) if cur and cur["item"] else ""))
+            elif ch in (curses.KEY_ENTER, 10, 13):
+                cur = self.cur()
+                if cur and cur["url"]:
+                    self.open_and_raise(cur["url"])
+                else:
+                    self.msg = "这一行没有网址（移到含网址的行再按 Enter）"
+            else:
+                cur = self.cur()
+                it = cur["item"] if cur else None
+                if cur and cur["kind"] == "mark" and it:
+                    cands = marks_for(it["prefix"], self.qpre)
+                    if ord("1") <= ch <= ord("9"):
+                        n = ch - ord("1")
+                        if n < len(cands):
+                            self.pick(it, cands[n][1])
+                    else:
+                        for k, tok in cands:
+                            if ch == ord(k):
+                                self.pick(it, tok); break
+
+
+def dump(path):
+    lines = open(path, encoding="utf-8").read().split("\n")
+    for s in parse(lines):
+        print(f"## {s['title']}")
+        for it in s["items"]:
+            print(f"  [{it['prefix']}{it['num']}] {it['title'][:50]}  mark={tokens_of(lines, it)}")
+
+
+def main():
+    args = sys.argv[1:]
+    date = args[args.index("--date") + 1] if "--date" in args else ""
+    cfg = load_cfg()
+    path = find_digest(cfg, date)
+    if not path or not os.path.exists(path):
+        print("找不到日报（先 radar run）", file=sys.stderr); return 1
+    if "--dump" in args:
+        dump(path); return 0
+    curses.wrapper(lambda scr: App(scr, path).run())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

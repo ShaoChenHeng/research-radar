@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""周期复习报告（滚动更新前生成）。
+
+用法:
+  radar-review new   [--date D]   # 生成本期复习报告 md，stdout 打印路径
+  radar-review apply [--date D]   # 读取报告：标记(learned/like/dislike) + 评语 → 应用，并标记已应用
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import sys
+import tomllib
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG = os.path.join(ROOT, "config.toml")
+LEARN = {"learned", "done", "会了", "掌握", "学完"}
+CONFUSED = {"confused", "again", "没懂", "不懂", "看不懂"}
+LIKE = {"like", "喜欢", "赞"}
+DISLIKE = {"dislike", "不喜欢", "踩"}
+SEP = re.compile(r"[\s,，、/]+")
+BLOCK = re.compile(r"^###\s*\[([A-Za-z]+\d+)\]\s*(.+?)\s*$(.*?)(?=^###\s*\[|^##\s|\Z)", re.S | re.M)
+MARK = re.compile(r"^\s*[-*]\s*\*\*标记\*\*\s*[:：]\s*(.*)$", re.M)
+NOTE = re.compile(r"^\s*[-*]\s*\*\*评语\*\*\s*[:：]\s*(.*)$", re.M)
+
+
+def load_cfg():
+    return tomllib.load(open(CONFIG, "rb")) if os.path.exists(CONFIG) else {}
+
+
+def paths(cfg):
+    droot = os.path.join(ROOT, cfg.get("general", {}).get("data_dir", "data"))
+    state = os.path.join(droot, cfg.get("general", {}).get("state_dir", "state"))
+    review = os.path.join(droot, "review")
+    return droot, state, review
+
+
+def load_jsonl(p):
+    return [json.loads(l) for l in open(p, encoding="utf-8") if l.strip()] if os.path.exists(p) else []
+
+
+def write_jsonl(p, rows):
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp, p)
+
+
+def queue_sections(cfg):
+    return [s for s in cfg.get("sections", []) if s.get("kind") == "queue"]
+
+
+def append_fb(state, rec):
+    rec = {"ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+           "host": os.uname().nodename.split(".")[0], **rec}
+    os.makedirs(state, exist_ok=True)
+    with open(os.path.join(state, "feedback.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def cmd_new(argv):
+    date = argv[argv.index("--date") + 1] if "--date" in argv else datetime.date.today().isoformat()
+    cfg = load_cfg()
+    droot, state, review = paths(cfg)
+    days = int(cfg.get("curriculum", {}).get("refresh_days", 7))
+    rf = os.path.join(state, "refresh.json")
+    start = ""
+    if os.path.exists(rf):
+        try:
+            start = json.load(open(rf)).get("last_refresh", "")
+        except (OSError, ValueError):
+            start = ""
+    if not start or start > date:
+        # 没有记录、或窗口起点晚于今天（时钟/手动传日期等异常）→ 回退 refresh_days 天
+        start = (datetime.date.fromisoformat(date) - datetime.timedelta(days=days)).isoformat()
+
+    L = [f"# Research Radar · 复习报告（{start} ~ {date}）",
+         "",
+         "> 给每条打**标记**（`learned`=已学会 / `like` / `dislike`，可多个，空格分隔），可写**评语**；",
+         "> 完成后运行 `radar review apply` 应用（learned 归档、评语进反馈）。",
+         ""]
+    for s in queue_sections(cfg):
+        rows = load_jsonl(os.path.join(droot, s["queue"]))
+        act = [r for r in rows if r.get("status", "active") == "active"]
+        shown = [r for r in act if (r.get("last_shown") or "") >= start]
+        if not shown:
+            shown = sorted(act, key=lambda r: r.get("due", ""))[:20]
+        if not shown:
+            continue
+        L.append(f"## {s.get('title', s['id'])}")
+        L.append("")
+        for r in shown:
+            L.append(f"### [{r['id']}] {r.get('topic', '')}")
+            L.append(f"- 展示 {r.get('times', 0)} 次 · 上次 {r.get('last_shown') or '—'} · 难度 {r.get('level', 1)}")
+            L.append("- **标记**：")
+            L.append("- **评语**：")
+            L.append("")
+    os.makedirs(review, exist_ok=True)
+    out = os.path.join(review, f"{date}.md")
+    open(out, "w", encoding="utf-8").write("\n".join(L) + "\n")
+    print(out)
+    return 0
+
+
+def _queue_of(cfg, droot, qid):
+    for s in queue_sections(cfg):
+        p = os.path.join(droot, s["queue"])
+        rows = load_jsonl(p)
+        for r in rows:
+            if r.get("id") == qid:
+                return p, rows, r
+    return None, None, None
+
+
+def cmd_apply(argv):
+    date = argv[argv.index("--date") + 1] if "--date" in argv else datetime.date.today().isoformat()
+    cfg = load_cfg()
+    droot, state, review = paths(cfg)
+    path = os.path.join(review, f"{date}.md")
+    if not os.path.exists(path):
+        cands = sorted(glob.glob(os.path.join(review, "*.md")))
+        if not cands:
+            print("找不到复习报告（先 radar review new）", file=sys.stderr); return 1
+        path = cands[-1]
+    text = open(path, encoding="utf-8").read()
+    if "<!-- applied" in text:
+        print(f"该报告已应用过：{path}"); return 0
+
+    learned = confused = likes = dislikes = comments = 0
+    for m in BLOCK.finditer(text):
+        qid, topic, body = m.group(1), m.group(2).strip(), m.group(3)
+        mk = MARK.search(body)
+        toks = [t for t in SEP.split(mk.group(1).strip().lower()) if t] if mk else []
+        note = NOTE.search(body)
+        note = note.group(1).strip() if note else ""
+        p, rows, row = _queue_of(cfg, droot, qid)
+        if row is None:
+            continue
+        if any(t in LEARN for t in toks):
+            row["status"] = "learned"; write_jsonl(p, rows); learned += 1
+        if any(t in CONFUSED for t in toks):
+            row["due"] = (datetime.date.fromisoformat(date) + datetime.timedelta(days=1)).isoformat()
+            write_jsonl(p, rows); confused += 1
+        for sig, toks_set in (("like", LIKE), ("dislike", DISLIKE)):
+            if any(t in toks_set for t in toks):
+                append_fb(state, {"type": "item", "target": qid, "signal": sig,
+                                  "topics": [row.get("topic", topic)], "title": topic, "date": date})
+                if sig == "like":
+                    likes += 1
+                else:
+                    dislikes += 1
+        if note:
+            append_fb(state, {"type": "comment", "target": qid, "topic": row.get("topic", topic),
+                              "text": note, "date": date})
+            comments += 1
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"\n<!-- applied {date} -->\n")
+    print(f"✓ 已应用：learned {learned}、confused {confused}、like {likes}、dislike {dislikes}、评语 {comments}  （{path}）")
+    return 0
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in ("new", "apply"):
+        print(__doc__); return 2
+    return cmd_new(sys.argv[2:]) if sys.argv[1] == "new" else cmd_apply(sys.argv[2:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""radar-open <url|path> —— 在当前屏幕的浏览器里打开，并把浏览器窗口置顶（KDE/Wayland）。
+
+思路（与 TUI 的 Enter 一致）：
+  1) 先把“当前屏幕”的浏览器窗口激活 → 让 Chrome 把新标签开在这一屏；
+  2) xdg-open 打开链接；
+  3) 再按 arXiv 编号匹配新标签所在窗口并置顶。
+非 KDE / 无 qdbus 时自动退化成直接 xdg-open。路径（本地目录）直接交给 xdg-open，不置顶。
+
+用法: radar-open <url|path> [--no-raise]
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+BROWSER_CLASSES = ["chrome", "chromium", "firefox", "brave", "vivaldi", "edge",
+                   "falkon", "konqueror", "opera", "epiphany", "librewolf",
+                   "waterfox", "qutebrowser"]
+DEVNULL = subprocess.DEVNULL
+
+
+def have(c):
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        f = os.path.join(p, c)
+        if os.path.exists(f) and os.access(f, os.X_OK):
+            return f
+    return ""
+
+
+def openers():
+    out = []
+    for c, pre in (("xdg-open", []), ("gio", ["open"])):
+        p = have(c)
+        if p:
+            out.append([p, *pre])
+    return out
+
+
+def url_hint(url):
+    """从链接里取匹配窗口标题的线索（arXiv 编号最好用）。"""
+    import re
+    m = re.search(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"(\d{4}\.\d{4,5})(?:v\d+)?(?:\.pdf)?$", url)
+    return m.group(1) if m else ""
+
+
+def raise_script(hint, classes):
+    cls = ",".join(json.dumps(c) for c in classes)
+    return f"""var HINT = {json.dumps(hint)};
+var CLASSES = [{cls}];
+var ws = workspace.windowList();
+var activeOutput = null;
+try {{ activeOutput = workspace.activeWindow ? workspace.activeWindow.output : null; }} catch (e) {{}}
+var sameMatch = null, sameAny = null, anyMatch = null, anyAny = null;
+for (var i = 0; i < ws.length; i++) {{
+  var w = ws[i];
+  var rc = (w.resourceClass || "").toString().toLowerCase();
+  var hit = false;
+  for (var j = 0; j < CLASSES.length; j++) {{
+    if (rc.indexOf(CLASSES[j]) >= 0) {{ hit = true; break; }}
+  }}
+  if (!hit) continue;
+  var onCur = false;
+  try {{ onCur = !!(activeOutput && w.output === activeOutput); }} catch (e) {{}}
+  var isMatch = !!(HINT && (w.caption || "").toString().indexOf(HINT) >= 0);
+  if (!anyAny) anyAny = w;
+  if (isMatch && !anyMatch) anyMatch = w;
+  if (onCur) {{
+    if (!sameAny) sameAny = w;
+    if (isMatch && !sameMatch) sameMatch = w;
+  }}
+}}
+var target = sameMatch || sameAny;   // 只在“当前屏幕”置顶，绝不切屏
+if (target) {{
+  if (target.minimized) target.minimized = false;
+  try {{ target.desktops = [workspace.currentDesktop]; }} catch (e) {{}}
+  try {{ target.activities = [workspace.currentActivity]; }} catch (e) {{}}
+  workspace.activeWindow = target;
+}}
+"""
+
+
+def raise_window(hint):
+    qdbus = have("qdbus6") or have("qdbus")
+    if not qdbus:
+        return False
+    path = os.path.join(tempfile.gettempdir(), "radar-raise.js")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(raise_script(hint, BROWSER_CLASSES))
+        for args in (["/Scripting", "org.kde.kwin.Scripting.loadScript", path, "radarraise"],
+                     ["/Scripting", "org.kde.kwin.Scripting.start"]):
+            subprocess.run([qdbus, "org.kde.KWin", *args],
+                           stdout=DEVNULL, stderr=DEVNULL, timeout=6)
+        time.sleep(0.25)
+        subprocess.run([qdbus, "org.kde.KWin", "/Scripting",
+                        "org.kde.kwin.Scripting.unloadScript", "radarraise"],
+                       stdout=DEVNULL, stderr=DEVNULL, timeout=6)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def open_target(target):
+    if not target:
+        return 1
+    for op in openers():
+        try:
+            p = subprocess.Popen(op + [target], stdout=DEVNULL, stderr=DEVNULL)
+            try:
+                p.communicate(timeout=8)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                return 0            # 还在跑 = 已交给桌面，算成功
+            if p.returncode in (0, None):
+                return 0
+        except OSError:
+            pass
+    return 2
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--no-raise"]
+    if not args:
+        print(__doc__.strip().splitlines()[0], file=sys.stderr)
+        return 2
+    target = args[0]
+    is_url = target.startswith(("http://", "https://"))
+    if not is_url and not os.path.exists(target):
+        # 本地路径先查存在性：直接把坏路径丢给 xdg-open 会触发 KDE 的 KIO 报错弹窗
+        print(f"[radar-open] 找不到路径: {target}", file=sys.stderr)
+        return 1
+    if is_url and "--no-raise" not in sys.argv[1:]:
+        raise_window("")                     # ① 先把当前屏浏览器带到前台
+        time.sleep(0.15)
+    rc = open_target(target)
+    if rc:
+        return rc
+    if is_url and "--no-raise" not in sys.argv[1:]:
+        time.sleep(0.7)
+        raise_window(url_hint(target))       # ③ 再按编号精确置顶
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""按 config.toml 的 [[sections]] 生成给 agent 的 prompt。
+
+用法: radar-prompt <config.toml> <date> <out.md> <candidates.jsonl> <selected.json>
+"""
+import sys
+import tomllib
+import os
+import json
+import subprocess
+
+
+def load_prefs():
+    fb = os.path.join(os.path.dirname(os.path.abspath(__file__)), "radar-fb")
+    try:
+        out = subprocess.run([fb, "prefs"], capture_output=True, text=True, timeout=15).stdout.strip()
+        if out:
+            return json.loads(out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return {"mute": [], "boost": {}}
+
+
+def main():
+    if len(sys.argv) < 6:
+        print(__doc__)
+        return 2
+    cfg_path, date, out, cand, sel = sys.argv[1:6]
+    cfg = tomllib.load(open(cfg_path, "rb"))
+    sections = cfg.get("sections", [])
+
+    L = []
+    L.append(f"@daily-digest 生成一份 Research Radar 日报，包含 {len(sections)} 个栏目（**按下面顺序**）。")
+    L.append("")
+    L.append(f"- 日期：{date}")
+    L.append("- **只读本地文件，不要联网、不要用 shell。** 数据：")
+    L.append(f"  - 实时抓取候选：{cand}（每行一条 JSON：source/title/link/id/date/abstract；rss 条目另有 origin=来源网站）")
+    L.append(f"  - 课程队列已选：{sel}（按栏目 id 分组：{{\"<id>\": [条目…]}}，字段 topic/gist/why/refs/level）")
+    prof = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "profile.md"))
+    if os.path.exists(prof):
+        L.append("")
+        L.append("## 用户画像（选择/排序时据此，越贴越好）")
+        L.append(open(prof, encoding="utf-8").read().strip())
+    L.append("")
+    L.append("栏目（**标题 / ID 前缀 / 条数 / 分点标签一律以此为准**）：")
+    for i, s in enumerate(sections, 1):
+        kind = s.get("kind")
+        pre = s.get("prefix", "?")
+        f = (s.get("fields") or ["内容1", "内容2", "链接"])[:3]
+        f += ["", "", ""][len(f):]
+        mn, mx = s.get("min", 1), s.get("max", 3)
+        L.append(f"{i}. id=`{s.get('id')}`　标题：`{s.get('title')}`　ID 前缀：`{pre}N`")
+        if kind == "feed":
+            srcs = s.get("sources") or []
+            flt = [f"**时间窗 {s.get('window_days', 3)} 天内**"]
+            if srcs:
+                flt.append(f"**只能选 source ∈ {srcs} 的候选，其它 source 一律不要**")
+            if s.get("categories"):
+                flt.append(f"categories={s.get('categories')}")
+            if s.get("max_per_origin"):
+                flt.append(f"**同一 origin（来源网站）最多 {s.get('max_per_origin')} 条**")
+            L.append("   - 数据：候选文件（见上）。过滤：" + "；".join(flt) + "。")
+            if s.get("keywords"):
+                if s.get("require_keyword", True) is False:
+                    L.append(f"   - 兴趣偏好 keywords={s.get('keywords')}：**仅用于排序**（命中的优先）；**没有命中的也可以选**（尤其是轻松有趣类）。")
+                else:
+                    L.append(f"   - 必须命中 keywords 之一：{s.get('keywords')}。")
+            if s.get("groups"):
+                cap = s.get("max_per_group")
+                names = "；".join(
+                    str(g.get("name", "?")) + (f"=[{', '.join(g.get('kw') or [])}]" if g.get("kw") else "")
+                    for g in s["groups"])
+                if cap:
+                    L.append(f"   - 子方向覆盖：**同一子方向最多 {cap} 条**，尽量覆盖不同子方向、别偏科。分组：{names}")
+                else:
+                    L.append(f"   - 子方向分组（尽量覆盖不同组）：{names}")
+            L.append(f"   - 排序去重后取 {mn}–{mx} 条；分点：`{f[0]}`=做了什么、`{f[1]}`=结论（尽量带数字）、`{f[2]}`=[文字](候选里的 link)。")
+        else:
+            L.append(f"   - 数据：`{sel}` 中 id=`{s.get('id')}` 的数组（**顺序与数量不变**）。")
+            L.append(f"   - 分点：`{f[0]}`=用 gist、`{f[1]}`=用 why、`{f[2]}`=[文字](refs)。")
+        if s.get("note"):
+            L.append(f"   - 备注：{s.get('note')}")
+    L.append("")
+    L.append(f"- 用 write 工具写到这个精确路径（Markdown 正文，不要包代码块）：{out}")
+    L.append("- **若文件已存在，整体重写覆盖。**")
+    L.append("- 严格按 references/digest-format.md：每个栏目 `## 标题`（不带序号），每条 `### [前缀N] 标题` + 三个分点 + **最后一行 `- **标记**：`（留空）**；来源/参考必须是 Markdown 链接。")
+    L.append("- queue 栏目直接用给定 gist/why（可轻微润色），**不要编造、不要增删条目**；feed 栏目基于 abstract，信息不足以支撑结论的条目不写。")
+    L.append("- feed 栏目**宁缺毋滥**：相关条目不足时就少给（可低于 min），**不要为凑数硬塞**；兴趣类内容与主业无关时可省略。")
+    L.append("- feed 栏目**每条都必须有链接分点**（否则去重失效、次日会重复）。")
+    p = load_prefs()
+    more = [k for k, v in p.get("boost", {}).items() if v > 0]
+    less = [k for k, v in p.get("boost", {}).items() if v < 0]
+    if p.get("mute") or more or less:
+        L.append(f"- 用户偏好（参考，别硬套）：屏蔽={p.get('mute', [])}；偏好={more}；不喜欢={less}。")
+    L.append("- **效率**：不要调用子代理（subagent）；每个文件最多读一次、不要反复 grep；最多再 1–2 次工具调用就直接 write。")
+    L.append("- 完成后用一行说明每个栏目各取了几条。")
+    print("\n".join(L))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

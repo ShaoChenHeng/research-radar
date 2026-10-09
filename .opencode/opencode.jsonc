@@ -1,0 +1,23 @@
+{
+  // Research Radar —— OpenCode 自身接线（模型/权限）。
+  // 业务参数请在根目录 config.toml 里改，不要写在这里。
+  "$schema": "https://opencode.ai/config.json",
+
+  // 默认模型（无人值守时 bin/radar 会用 --model 覆盖并做 fallback）
+  "model": "deepseek/deepseek-flash",
+
+  // 不用付费搜索；抓取走 webfetch + 免费 API
+  "websearch": false,
+
+  // 无头运行（opencode run --auto）：数据由 runner 预抓到本地，agent 只读本地/写文件。
+  // 显式 deny 的仍然禁止（防联网狂刷 / 防读密钥 / 防越界）。
+  "permissions": [
+    { "action": "read", "resource": "*.env*", "effect": "deny" },
+    { "action": "external_directory", "resource": "*", "effect": "deny" },
+    { "action": "shell", "resource": "*", "effect": "deny" },
+    { "action": "webfetch", "resource": "*", "effect": "deny" },
+    { "action": "execute", "resource": "*", "effect": "deny" },
+    { "action": "subagent", "resource": "*", "effect": "deny" },
+    { "action": "shell", "resource": "*radar fb *", "effect": "allow" }
+  ]
+}
