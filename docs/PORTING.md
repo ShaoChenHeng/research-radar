@@ -1,34 +1,35 @@
-# 迁移 / 部署到新主机（manbo 之类的第二台机）
+# 迁移 / 部署到新主机
 
 目标目录：`~/github-project/research-radar`（`systemd/*.service` 里的路径写死为 `%h/github-project/research-radar`，换目录要同步改）。
 
 ## 0) 依赖
 ```bash
+# 以 Arch 为例：
 sudo pacman -S --needed git curl python rsync util-linux libnotify wl-clipboard
 # OpenCode（≥2）：见官方安装方式；装完要登录一次，凭据不进 git：
-opencode auth login      # 选 DeepSeek，用你自己的 key
+opencode auth login      # 选 deepseek，用你自己的 key
 ```
 可选（TUI/Emacs 增强）：`qdbus`（KDE 下把浏览器置顶）、`wl-copy`（复制链接）、`emacs`。
 
-## 1) 拿到代码+数据（一条脚本）
-打包端（旧机）：
+## 1) 拿到代码 + 数据
+推荐直接用 git（见 §3）。若走「打包传输」：
 ```bash
+# 旧机：打包（代码仓；data/ 建议单独走 git，或用 rsync 同步）
 tar czf radar-migrate.tar.gz research-radar
-sudo tailscale file cp radar-migrate.tar.gz radar-manbo-setup.sh manbo:   # 脚本随包一起发
+# 用你惯用的方式把包传到新机（rsync / scp / 网盘…），放到目标目录
 ```
-新机（manbo）：
+新机：
 ```bash
 mkdir -p ~/github-project && cd ~/github-project
-sudo tailscale file get .        # 收下上面两个文件（get 通常要 root）
-bash radar-manbo-setup.sh        # 取包→解包→修属主→依赖检查→建 radar 软链
-```
-`radar-manbo-setup.sh` 与仓库里的 `bin/radar-setup-host` 是同一个脚本。它也能在仓库里直接跑（做依赖检查/软链/可选装单元）：
-```bash
+# 把 radar-migrate.tar.gz 放到这里，然后（取包命令可用 RADAR_FETCH_CMD 指定）：
+RADAR_FETCH_CMD='cp /path/to/radar-migrate.tar.gz .' \
+  research-radar/bin/radar-setup-host
+# 或者：先手动解包，再进仓库内直接跑（只做依赖检查/软链/可选装单元）
 research-radar/bin/radar-setup-host [--dir DIR] [--tar FILE] [--no-get] [--install-units] [--force]
 ```
 
 ## 2) 定时任务（用 generate_on 指定唯一主生成机）
-在 `config.toml` 的 `[general]` 里设 `generate_on = "ColdFlsh"`（填主生成机的短主机名，取 `uname -n`）。
+在 `config.toml` 的 `[general]` 里设 `generate_on = "<主生成机主机名>"`（取 `uname -n` 的短名）。
 之后**只有该主机名的那台**会真正生成日报；其它机器 `radar run` 会先 `pull`、再直接退出（只同步、不生成）。
 所以现在**可以两台都装 timer**：
 ```bash
@@ -37,13 +38,13 @@ bin/radar-setup-host --install-units    # 或直接 bin/radar-install-units
 ```
 > `generate_on` 留空时退回旧行为：不限制主机，此时**只在一台开 timer**，否则同一天各生成一份会冲突。
 
-## 3) 用 git 拉取代码 + 数据（替代 tar 打包）
+## 3) 用 git 拉取代码 + 数据
 代码仓（公开）与数据仓（私有）分开，`data/` 是被外层 `.gitignore` 忽略的嵌套仓，要单独 clone：
 ```bash
 cd ~/github-project
 git clone git@github.com:<你>/research-radar.git
 cd research-radar
-cp config.example.toml config.toml     # 再按需改（generate_on 等）
+cp config.example.toml config.toml     # 再按需改（generate_on、代理等）
 cp profile.example.md profile.md
 git clone git@github.com:<你>/research-radar-data.git data
 bin/radar --help

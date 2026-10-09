@@ -3,7 +3,7 @@
 > 一句话：一个 **可迁移、多机同步、每日仅一次** 的科研雷达（模型默认 deepseek，可在 config 换成免费）。开机后自动用 **OpenCode** 抓取并汇总栏目内容，按 `年/月/日` 归档；带 **反馈闭环** 与 **KDE 桌面通知**；用 **Emacs** 看 Markdown/PDF。
 
 - 状态：**已实现（阶段 0–7 完成；本文档随实现对齐）**
-- 目标宿主：Arch + KDE Plasma 6 (Wayland) 的 Legion Y7000（主），未来迁移到其他机器
+- 目标宿主：Arch + KDE Plasma 6 (Wayland)（主），未来迁移到其他机器
 - 运行器：OpenCode v2.0.20（`opencode run` 无头模式）
 
 ---
@@ -340,7 +340,7 @@ radar pdf --date 2026-10-06 a1
 | ② 知识 | 经典论文/概念（backlog 见 `curriculum.jsonl`） | 本地队列 + webfetch 摘要 | M1 预制 40 条 |
 | ③ Linux | man/Arch Wiki/`systemd`/内核文档、Arch news | webfetch | 直连 ✅；面向"训练/部署效率" |
 
-> **网络适配**：本机 `huggingface.co`、`news.ycombinator.com` 被墙；主力**全走直连可用源**（arXiv / hf-mirror / HN-API）。需要时可选走本机代理 `HTTPS_PROXY=http://127.0.0.1:7891`，但**不作为依赖**。
+> **网络适配**：本机 `huggingface.co`、`news.ycombinator.com` 被墙；主力**全走直连可用源**（arXiv / hf-mirror / HN-API）。需要时可选走本机代理 `HTTPS_PROXY=http://127.0.0.1:<端口>`，但**不作为依赖**。
 
 > 原则：**能 `webfetch` 就不加 MCP**——MCP 工具会占上下文。MCP 只用于结构化/高频来源（arxiv、filesystem）。
 
@@ -423,7 +423,7 @@ description: 生成每日日报——栏目以 prompt 里的 [[sections]] 为准
 
 ### 11.2 数据模型（`data/state/feedback.jsonl`，追加式）
 ```json
-{"ts":"2026-10-06T09:10:00+08:00","host":"ColdFlsh","type":"item","target":"a1","signal":"like","topics":["lora","peft"],"title":"…"}
+{"ts":"2026-10-06T09:10:00+08:00","host":"myhost","type":"item","target":"a1","signal":"like","topics":["lora","peft"],"title":"…"}
 {"ts":"…","type":"topic","target":"agentic rag","signal":"more"}
 {"ts":"…","type":"mute","target":"crypto"}
 ```

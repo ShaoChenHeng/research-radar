@@ -42,7 +42,7 @@
 ---
 
 ## 阶段 0 · 环境自检（★，只读）—— ✅ 已完成（2026-10-06）
-**结果**：见 [`docs/ENV-CHECK.md`](./docs/ENV-CHECK.md)。依赖/模型/通知/主源**均可用**；网络适配点：HF 用 `hf-mirror.com`、HN 用 Firebase API、语义学者加退避、可选代理 `127.0.0.1:7891`、`jq` 缺（用 python3 顶）。
+**结果**：见 [`docs/ENV-CHECK.md`](./docs/ENV-CHECK.md)。依赖/模型/通知/主源**均可用**；网络适配点：HF 用 `hf-mirror.com`、HN 用 Firebase API、语义学者加退避、可选代理 `127.0.0.1:<端口>`、`jq` 缺（用 python3 顶）。
 
 **目标**：确认整套能落地，交一份报告，避免后面踩坑。
 

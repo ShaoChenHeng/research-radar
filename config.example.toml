@@ -16,7 +16,7 @@ generate_on = ""
 # browser  = ""             # 可选：浏览器窗口类子串（如 "firefox"）。TUI 打开链接后用它把浏览器置顶；留空=自动识别常见浏览器
 
 [network]
-proxy       = ""            # 例: "http://127.0.0.1:7891"；留空=直连
+proxy       = ""            # 例: "http://127.0.0.1:7890"（端口按你的代理改）；留空=直连
 proxy_hosts = ["huggingface.co", "news.ycombinator.com"]
 
 [models]
