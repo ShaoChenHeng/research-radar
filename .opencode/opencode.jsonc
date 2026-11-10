@@ -9,15 +9,24 @@
   // 不用付费搜索；抓取走 webfetch + 免费 API
   "websearch": false,
 
-  // 无头运行（opencode run --auto）：数据由 runner 预抓到本地，agent 只读本地/写文件。
-  // 显式 deny 的仍然禁止（防联网狂刷 / 防读密钥 / 防越界）。
+  // 无头运行（opencode run --auto）：agent 只读本地/写文件。
+  //
+  // 注意：整片 deny「shell」「execute」会把对应工具禁用，导致使用 OpenCode
+  // 免费模型时报 “free tier can only be used from within OpenCode”。
+  // 因此这里不再整片禁用，改为只显式拦截危险命令；其余安全约束保留。
   "permissions": [
+    // 防读密钥 / 防越界 / 防联网 / 禁子代理
     { "action": "read", "resource": "*.env*", "effect": "deny" },
     { "action": "external_directory", "resource": "*", "effect": "deny" },
-    { "action": "shell", "resource": "*", "effect": "deny" },
     { "action": "webfetch", "resource": "*", "effect": "deny" },
-    { "action": "execute", "resource": "*", "effect": "deny" },
     { "action": "subagent", "resource": "*", "effect": "deny" },
-    { "action": "shell", "resource": "*radar fb *", "effect": "allow" }
+
+    // shell：只拦危险命令（其余走基础策略）
+    { "action": "shell", "resource": "sudo *", "effect": "deny" },
+    { "action": "shell", "resource": "* sudo *", "effect": "deny" },
+    { "action": "shell", "resource": "*rm -rf*", "effect": "deny" },
+    { "action": "shell", "resource": "*curl *", "effect": "deny" },
+    { "action": "shell", "resource": "*wget *", "effect": "deny" },
+    { "action": "shell", "resource": "git push *", "effect": "deny" }
   ]
 }

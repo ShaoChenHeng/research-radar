@@ -39,6 +39,32 @@ def openers():
     return out
 
 
+def file_manager():
+    for c in ("dolphin", "nautilus", "nemo", "thunar", "pcmanfm", "kfmclient5"):
+        p = have(c)
+        if p:
+            return p
+    return ""
+
+
+def open_dir(path, select=None):
+    """在文件管理器里打开目录；能选中时顺便选中 select（通常是当天日报 md）。"""
+    fm = file_manager()
+    if fm:
+        base = os.path.basename(fm)
+        argv = [fm]
+        if select and base in ("dolphin", "nautilus", "nemo"):
+            argv += ["--select", select]
+        else:
+            argv += [path]
+        try:
+            subprocess.Popen(argv, stdout=DEVNULL, stderr=DEVNULL)
+            return 0
+        except OSError:
+            pass
+    return open_target(path)   # 没有已知文件管理器 → 交给 xdg-open/gio
+
+
 def url_hint(url):
     """从链接里取匹配窗口标题的线索（arXiv 编号最好用）。"""
     import re
@@ -130,23 +156,39 @@ def open_target(target):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if a != "--no-raise"]
+    raw = sys.argv[1:]
+    no_raise = "--no-raise" in raw
+    args = [a for a in raw if a != "--no-raise"]
+    select = None
+    if "--select" in args:
+        i = args.index("--select")
+        if i + 1 < len(args):
+            select = args[i + 1]
+            del args[i:i + 2]
+    if select:
+        sel = os.path.abspath(select)
+        if not os.path.exists(sel):
+            print(f"[radar-open] 找不到路径: {sel}", file=sys.stderr)
+            return 1
+        return open_dir(os.path.dirname(sel), sel)
     if not args:
         print(__doc__.strip().splitlines()[0], file=sys.stderr)
         return 2
     target = args[0]
+    if os.path.isdir(target):
+        return open_dir(os.path.abspath(target))
     is_url = target.startswith(("http://", "https://"))
     if not is_url and not os.path.exists(target):
         # 本地路径先查存在性：直接把坏路径丢给 xdg-open 会触发 KDE 的 KIO 报错弹窗
         print(f"[radar-open] 找不到路径: {target}", file=sys.stderr)
         return 1
-    if is_url and "--no-raise" not in sys.argv[1:]:
+    if is_url and not no_raise:
         raise_window("")                     # ① 先把当前屏浏览器带到前台
         time.sleep(0.15)
     rc = open_target(target)
     if rc:
         return rc
-    if is_url and "--no-raise" not in sys.argv[1:]:
+    if is_url and not no_raise:
         time.sleep(0.7)
         raise_window(url_hint(target))       # ③ 再按编号精确置顶
     return 0

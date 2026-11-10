@@ -6,7 +6,7 @@ curses，标准库，无依赖。
 按键:  j/k 或 C-n/C-p 逐行 · C-v/M-v 翻页 · M-< / M-> 首尾 · [ / ] 前一天/后一天
        H 打开「历史日报」选择器 · 到「标记：」行弹候选（l/d/c/s/e 或数字）
        到含网址的行 → Enter 打开（并把浏览器置顶）· Y 复制链接 · C 细聊（续日报 session）
-       a 应用 · g 重新读取文件 · o 打开文件夹 · ? 帮助 · q 退出
+       a 应用 · D 下载本页已标 save · R 已读 · g 重新读取文件 · o 打开文件夹 · ? 帮助 · q 退出
 """
 import curses
 import glob
@@ -27,9 +27,10 @@ BROWSER_CLASSES = ["chrome", "chromium", "firefox", "brave", "vivaldi", "edge",
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG = os.path.join(ROOT, "config.toml")
-FEED_MARKS = [("l", "like"), ("d", "dislike"), ("c", "confused"), ("s", "save")]
-QUEUE_MARKS = [("l", "like"), ("d", "dislike"), ("c", "confused"), ("e", "learned")]
+BASE_MARKS = [("l", "like"), ("d", "dislike"), ("c", "confused")]
 MD_TOKEN = re.compile(r"^(- \*\*标记\*\*：)\s*(.*)$")
+READ_RE = re.compile(r"^- \*\*已读\*\*：\s*(.*)$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ITEM_RE = re.compile(r"^###\s*\[([A-Za-z]+)(\d+)\]\s*(.*)$")
 LINK_RE = re.compile(r"\]\((https?://[^)]+)\)")
 URL_RE = re.compile(r"https?://[^\s)）]+")
@@ -102,7 +103,9 @@ def digest_dir(cfg):
 
 
 def all_digests(cfg):
-    return sorted(glob.glob(os.path.join(digest_dir(cfg), "**", "*.md"), recursive=True))
+    # 只认 YYYY-MM-DD.md，避免把「阅读报告」等其它 md 混进日报列表
+    return sorted(f for f in glob.glob(os.path.join(digest_dir(cfg), "**", "*.md"), recursive=True)
+                  if DATE_RE.match(os.path.basename(f)[:-3]))
 
 
 def find_digest(cfg, date):
@@ -120,8 +123,19 @@ def queue_prefixes(cfg):
     return {s.get("prefix") for s in cfg.get("sections", []) if s.get("kind") == "queue"}
 
 
-def marks_for(prefix, qpre):
-    return QUEUE_MARKS if prefix in qpre else FEED_MARKS
+def download_prefixes(cfg):
+    """可下载（download 非 false，默认 true，与 radar-pdf 一致）的栏目 prefix。"""
+    return {s.get("prefix") for s in cfg.get("sections", [])
+            if s.get("prefix") and s.get("download", True)}
+
+
+def marks_for(prefix, qpre, dpre):
+    marks = list(BASE_MARKS)
+    if prefix in dpre:
+        marks.append(("s", "save"))
+    if prefix in qpre:
+        marks.append(("e", "learned"))
+    return marks
 
 
 def openers():
@@ -244,6 +258,9 @@ def render(ln):
         return "▌ " + strip_md(ln[3:].strip()), "h1"
     if ln.startswith("### "):
         return strip_md(ln[4:].strip()), "h2"
+    mr = READ_RE.match(ln)
+    if mr:
+        return "整份日报 · 已读" + (" ✓" if mr.group(1).strip() else " ☐"), "read"
     m = MD_TOKEN.match(ln)
     if m:
         return "标记：" + m.group(2), "mark"
@@ -266,6 +283,7 @@ class App:
         self.scr = scr
         self.cfg = load_cfg()
         self.qpre = queue_prefixes(self.cfg)
+        self.dpre = download_prefixes(self.cfg)
         self.files = all_digests(self.cfg)
         self.path = path
         self.di = self.files.index(path) if path in self.files else len(self.files) - 1
@@ -278,7 +296,8 @@ class App:
         self.load()
 
     def init_colors(self):
-        self.C = {"h1": curses.A_BOLD, "h2": curses.A_BOLD, "mark": curses.A_BOLD, "link": 0}
+        self.C = {"h1": curses.A_BOLD, "h2": curses.A_BOLD, "mark": curses.A_BOLD, "link": 0,
+                  "read": curses.A_BOLD}
         try:
             curses.start_color(); curses.use_default_colors()
             curses.init_pair(1, curses.COLOR_CYAN, -1)
@@ -286,7 +305,8 @@ class App:
             curses.init_pair(3, curses.COLOR_GREEN, -1)
             curses.init_pair(4, curses.COLOR_MAGENTA, -1)
             self.C = {"h1": curses.color_pair(1) | curses.A_BOLD, "h2": curses.color_pair(2) | curses.A_BOLD,
-                      "mark": curses.color_pair(3) | curses.A_BOLD, "link": curses.color_pair(4)}
+                      "mark": curses.color_pair(3) | curses.A_BOLD, "link": curses.color_pair(4),
+                      "read": curses.color_pair(3) | curses.A_BOLD}
         except curses.error:
             pass
 
@@ -297,6 +317,17 @@ class App:
         self.lines = open(self.path, encoding="utf-8").read().rstrip().split("\n")
         self.secs = parse(self.lines)
         self.items = all_items(self.secs)
+        self.read_idx = next((i for i, ln in enumerate(self.lines) if READ_RE.match(ln)), None)
+        # 末尾「---/空行/- **已读**」块不属于任何条目 → 收窄最后一个条目的 end
+        if self.read_idx is not None:
+            j = self.read_idx
+            while j > 0 and (not self.lines[j - 1].strip() or re.match(r"^-{3,}\s*$", self.lines[j - 1])):
+                j -= 1
+            for it in self.items:
+                if it["end"] > j:
+                    it["end"] = j
+        mr = READ_RE.match(self.lines[self.read_idx]) if self.read_idx is not None else None
+        self.is_read = bool(mr and mr.group(1).strip())
         self.rebuild()
 
     def rebuild(self):
@@ -323,8 +354,15 @@ class App:
             if d["src"] == src:
                 self.cursor = i; return
 
-    def save_lines(self, lines, src):
-        write_file(self.path, lines); self.load(); self.goto_src(src)
+    def save_lines(self, lines, src, keep=False):
+        cur, scr = self.cursor, self.scroll
+        write_file(self.path, lines); self.load()
+        if keep:
+            # 打标后保持光标与页面不动（不做 goto_src / 不重置 scroll）
+            self.cursor = max(0, min(cur, len(self.dlines) - 1))
+            self.scroll = max(0, min(scr, max(0, len(self.dlines) - 1)))
+        else:
+            self.goto_src(src)
 
     def switch_day(self, d):
         nd = self.di + d
@@ -356,7 +394,11 @@ class App:
         top, bot = 1, H - 2
         view = bot - top
         name = f" Research Radar · {os.path.basename(self.path)[:-3]}  ({self.di + 1}/{len(self.files)}) "
-        self.put(0, 0, name + " " * max(0, W - 1 - swidth(name)), curses.A_REVERSE)
+        bar = curses.A_REVERSE
+        if self.is_read:
+            name += " ✓ 已读 "
+            bar |= self.C.get("read", 0)
+        self.put(0, 0, name + " " * max(0, W - 1 - swidth(name)), bar)
         if self.cursor < self.scroll:
             self.scroll = self.cursor
         if self.cursor >= self.scroll + view:
@@ -374,6 +416,8 @@ class App:
             attr = self.C.get(d["kind"], 0)
             if d["kind"] == "text" and d["url"]:
                 attr = self.C["link"]
+            if self.is_read and d["kind"] == "h1":
+                attr = self.C.get("read", attr)
             self.put(top + n, 1, d["text"], attr)
         cur = self.cur()
         if cur and cur["kind"] == "mark" and cur["item"]:
@@ -386,7 +430,7 @@ class App:
         else:
             status = ""
         self.put(H - 2, 0, " " + status + " " * max(0, W - 1 - swidth(status) - 1), curses.A_REVERSE)
-        self.put(H - 1, 0, " j/k 移动 · C-v 翻页 · [ ] 切天 · H 历史 · C 对话 · Enter 开链接 · a 应用 · ? 帮助 · q 退出", curses.A_DIM)
+        self.put(H - 1, 0, " j/k 移动 · C-v 翻页 · [ ] 切天 · H 历史 · C 对话 · Enter 开链接 · a 应用 · D 下载 · R 已读 · ? 帮助 · q 退出", curses.A_DIM)
         if self.picker:
             self.draw_picker(H, W)
         elif self.help:
@@ -408,7 +452,7 @@ class App:
             self.put(y0 + 1 + i, x0 + 1, " " + fit(r, w - 3) + " " * max(0, w - 3 - swidth(r)), attr)
 
     def draw_marks(self, cy, W, item):
-        cands = marks_for(item["prefix"], self.qpre)
+        cands = marks_for(item["prefix"], self.qpre, self.dpre)
         toks = tokens_of(self.lines, item)
         rows = [f"{i + 1} {tok}" + ("  ✓" if tok in toks else "") for i, (k, tok) in enumerate(cands)]
         title = f"标记 [{item['prefix']}{item['num']}]"
@@ -438,9 +482,21 @@ class App:
             "到含网址的行 → Enter 打开（先落到当前屏幕的浏览器并置顶，不切屏）  ·  Y 复制链接",
             "C  细聊：续今日日报 session（它读过全部候选 → 可追问未入选的条目）",
             "g  重新读取文件（外部改动后）        a  应用标记（radar fb parse）",
-            "o  打开当天文件夹                    ?  帮助        q  退出",
+            "D  下载本页已标 save 的条目（radar pdf --saved）",
+            "R  切换整份日报「已读」标记（最末那行）",
+            "o  在文件管理器中打开当天目录（选中日报）  ?  帮助        q  退出",
         ]
         self._overlay(rows, "帮助", H, W)
+
+    def open_folder(self):
+        """在文件管理器中打开当天日报目录，并选中日报文件。"""
+        script = os.path.join(ROOT, "bin", "radar-open")
+        try:
+            subprocess.Popen([script, "--select", self.path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.msg = "已在文件管理器中打开当天目录"
+        except OSError:
+            self.open_url(os.path.dirname(self.path))
 
     def open_url(self, url):
         if not url:
@@ -499,14 +555,22 @@ class App:
         time.sleep(0.7)
         self.raise_window(url_hint(url))
 
-    def session_for(self, path):
-        """返回 (session_id, is_fallback)。
+    @staticmethod
+    def _is_native_session(sid):
+        """opencode 自己创建的 session id（形如 ses_<26位>）才认。
 
-        规则：优先用「本机生成今天日报」的那个 session；若日报是别的主机生成、
-        或没有记录，则用本机固定的兜底 session（ses-radar-local-<日期>）——
-        它由 opencode「不存在就创建」，所以后续每次 C 都会续同一个。
-        is_fallback=True 表示本机还没建过、需要带上日报上下文。
+        radar 早期用的 ses-radar-<日期> / ses-radar-local-<日期> 是自定义 id：
+        请求头 x-opencode-session 不被 OpenCode 服务端认，免费模型会报
+        “free tier can only be used from within OpenCode”。这类 id 一律视为不可用。
         """
+        return sid.startswith("ses_")
+
+    def session_for(self, path):
+        """返回 (session_id, fallback)。
+
+        规则：优先用「本机生成今天日报」的那个 session（必须是 opencode 原生 id）；
+        若日报是别的主机生成、记录是 radar 自定义 id、或没有记录，则返回 ("", True)，
+        由 chat() 新建一个 opencode 原生 session（免费模型才可用）。"""
         date = os.path.basename(path)[:-3]
         host = socket.gethostname().split(".")[0].lower()
         f = os.path.join(state_dir(self.cfg), "sessions", date + ".id")
@@ -515,20 +579,16 @@ class App:
         except OSError:
             parts = []
         if len(parts) == 2:
-            if parts[0].split(".")[0].lower() == host and parts[1].startswith("ses"):
-                return parts[1], False        # 本机生成的日报 session
-            # 记录显示是别的主机生成 → 直接用本机固定兜底，不再猜
-            return self._local_session(date)
-        if len(parts) == 1 and parts[0].startswith("ses"):
+            if (parts[0].split(".")[0].lower() == host
+                    and self._is_native_session(parts[1])):
+                return parts[1], False        # 本机生成的原生日报 session
+            # 记录是别的主机生成、或旧的自定义 id → 不再用，交给本机原生会话
+            return "", True
+        if len(parts) == 1 and self._is_native_session(parts[0]):
             return parts[0], False
-        # 没有记录（老日报）：本机若有同日期的日报 session 就续它，否则兜底
+        # 没有记录（老日报）：本机若有同日期、原生的日报 session 就续它，否则新建
         sid = self._find_local_digest_session(date)
-        return (sid, False) if sid else self._local_session(date)
-
-    def _local_session(self, date):
-        """本机固定兜底 session：不存在由 opencode 创建，存在就续 → 后续每次都同一个。"""
-        local = f"ses-radar-local-{date}"
-        return (local, False) if self._has_session(local) else (local, True)
+        return (sid, False) if sid else ("", True)
 
     def _session_lines(self):
         op = have("opencode")
@@ -541,38 +601,70 @@ class App:
             return []
         return (r.stdout or "").splitlines()
 
-    def _has_session(self, sid):
-        return any(ln.split("\t")[0].strip() == sid for ln in self._session_lines() if ln.strip())
+    def _session_ids(self):
+        """当前项目里所有 session id，按 opencode 的排序（新的在前）。"""
+        ids = []
+        for ln in self._session_lines():
+            c = ln.split("\t")[0].strip()
+            if c.startswith("ses"):
+                ids.append(c)
+        return ids
 
     def _find_local_digest_session(self, date):
         for ln in self._session_lines():
             cols = ln.split("\t")
             if (len(cols) >= 2 and date in cols[1]
                     and ("Radar" in cols[1] or "日报" in cols[1])
-                    and cols[0].strip().startswith("ses")):
+                    and self._is_native_session(cols[0].strip())):
                 return cols[0].strip()
         return ""
 
+    def _store_session(self, path, sid):
+        """把（opencode 原生）session id 记到 state/sessions/<日期>.id，下次 C 直接续。"""
+        date = os.path.basename(path)[:-3]
+        host = socket.gethostname().split(".")[0].lower()
+        f = os.path.join(state_dir(self.cfg), "sessions", date + ".id")
+        try:
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            with open(f, "w", encoding="utf-8") as fh:
+                fh.write(f"{host}\t{sid}\n")
+        except OSError:
+            pass
+
     def chat(self):
-        """进入 opencode 细聊：续「生成今天日报的那个 session」（直接进对话，不弹窗）。
-        若日报是别的主机生成、本机还没有 session，则用本机固定兜底 session + 预制 prompt 开场。"""
+        """进入 opencode 细聊（直接进对话，不弹窗）。
+
+        续「生成今天日报的那个 session」（须为 opencode 原生 id，免费模型才可用）；
+        若本机没有可用的原生 session，则**新建**一个并带预制 prompt 开场，
+        退出后记住它的 id，之后每次 C 都续同一个。"""
         op = have("opencode")
         if not op:
             self.msg = "找不到 opencode"
             return
         sid, fallback = self.session_for(self.path)
-        cmd = [op, ROOT, "--session", sid]
-        if fallback:                          # 本机首次 → 用预制 prompt 开场（之后每次直接续）
-            cmd += ["--prompt", chat_context(self.path) + CHAT_OPENER]
+        before = set(self._session_ids()) if not sid else set()
+        if sid:
+            cmd = [op, ROOT, "--session", sid]
+            if fallback:                      # 有记录但需要补上下文
+                cmd += ["--prompt", chat_context(self.path) + CHAT_OPENER]
+        else:
+            # 不指定 id → opencode 自己创建原生 session（免费模型可用）
+            cmd = [op, ROOT, "--prompt", chat_context(self.path) + CHAT_OPENER]
         curses.def_prog_mode()
         curses.endwin()
         try:
             subprocess.run(cmd, cwd=ROOT)
         except OSError:
             pass
-        curses.reset_prog_mode()
-        self.scr.clear()
-        self.scr.refresh()
+        finally:
+            if not sid:
+                for new in self._session_ids():
+                    if new not in before:
+                        self._store_session(self.path, new)
+                        break
+            curses.reset_prog_mode()
+            self.scr.clear()
+            self.scr.refresh()
 
     def copy_url(self, url):
         if not url:
@@ -587,8 +679,35 @@ class App:
 
     def pick(self, item, tok):
         src = item["mark"] if item["mark"] is not None else item["end"]
-        self.save_lines(set_mark(self.lines, item, tok), src)
+        self.save_lines(set_mark(self.lines, item, tok), src, keep=True)
         self.msg = f"{item['prefix']}{item['num']} 标记 {tok}（按 a 应用）"
+
+    def download_saved(self):
+        """下载当前日报里所有标了 save 的条目（radar pdf --saved --date 当天）。"""
+        date = os.path.basename(self.path)[:-3]
+        src = self.cur()["src"] if self.cur() else 0
+        self.msg = "下载中…（radar pdf --saved）"
+        self.draw()
+        r = subprocess.run([os.path.join(ROOT, "bin", "radar-pdf"), "--saved", "--date", date],
+                           capture_output=True, text=True)
+        o = (r.stdout or r.stderr).strip().splitlines()
+        self.load()
+        self.goto_src(src)
+        self.msg = o[-1] if o else "已下载"
+
+    def toggle_read(self):
+        """切换整份日报最末的「- **已读**：」标记。"""
+        i = self.read_idx
+        if i is None:
+            self.lines = self.lines + ["", "---", "", "- **已读**： yes"]
+            src, now = len(self.lines) - 1, True
+        else:
+            mr = READ_RE.match(self.lines[i])
+            was = bool(mr and mr.group(1).strip())
+            self.lines[i] = "- **已读**：" + ("" if was else " yes")
+            src, now = i, not was
+        self.save_lines(self.lines, src)
+        self.msg = "已标记为已读" if now else "已取消「已读」"
 
     def m_prefix(self):
         self.scr.timeout(60); nxt = self.scr.getch(); self.scr.timeout(-1)
@@ -652,8 +771,12 @@ class App:
                                    capture_output=True, text=True)
                 o = (r.stdout or r.stderr).strip().splitlines()
                 self.msg = o[-1] if o else "已应用"
+            elif ch == ord("D"):
+                self.download_saved()
+            elif ch == ord("R"):
+                self.toggle_read()
             elif ch == ord("o"):
-                self.open_url(os.path.dirname(self.path))
+                self.open_folder()
             elif ch == ord("Y"):
                 cur = self.cur()
                 self.copy_url(cur["url"] if cur and cur["url"] else (item_link(self.lines, cur["item"]) if cur and cur["item"] else ""))
@@ -667,7 +790,7 @@ class App:
                 cur = self.cur()
                 it = cur["item"] if cur else None
                 if cur and cur["kind"] == "mark" and it:
-                    cands = marks_for(it["prefix"], self.qpre)
+                    cands = marks_for(it["prefix"], self.qpre, self.dpre)
                     if ord("1") <= ch <= ord("9"):
                         n = ch - ord("1")
                         if n < len(cands):

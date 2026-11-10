@@ -13,6 +13,10 @@ hn_items   = 20             # Hacker News 取前 N 条详情
 # 多机同步：只有主机名等于此值的机器才会「生成」日报，其它机器只 pull/查看。
 # 留空 = 不限制（每台都能生成；此时注意只用一台开 timer）。取 `uname -n` 的短名。
 generate_on = ""
+# 生成方式：daily=每天生成；progressive=「最近一期」标了「已读」才生成今天。
+mode = "daily"
+# 整份日报总条数上限（各栏 min/max 只是单栏上下限；总数以这里为准）。
+max_total_items = 6
 # browser  = ""             # 可选：浏览器窗口类子串（如 "firefox"）。TUI 打开链接后用它把浏览器置顶；留空=自动识别常见浏览器
 
 [network]

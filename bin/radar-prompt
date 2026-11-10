@@ -28,6 +28,7 @@ def main():
     cfg_path, date, out, cand, sel = sys.argv[1:6]
     cfg = tomllib.load(open(cfg_path, "rb"))
     sections = cfg.get("sections", [])
+    mt = cfg.get("general", {}).get("max_total_items")
 
     L = []
     L.append(f"@daily-digest 生成一份 Research Radar 日报，包含 {len(sections)} 个栏目（**按下面顺序**）。")
@@ -83,6 +84,8 @@ def main():
     L.append("")
     L.append(f"- 用 write 工具写到这个精确路径（Markdown 正文，不要包代码块）：{out}")
     L.append("- **若文件已存在，整体重写覆盖。**")
+    if mt:
+        L.append(f"- **整份日报总条数不超过 {int(mt)} 条**：各栏 min/max 只是单栏上下限；若合计会超过，就按栏目顺序（靠前的优先）少给后面的，宁可不足、不要超。")
     L.append("- 严格按 references/digest-format.md：每个栏目 `## 标题`（不带序号），每条 `### [前缀N] 标题` + 三个分点 + **最后一行 `- **标记**：`（留空）**；来源/参考必须是 Markdown 链接。")
     L.append("- queue 栏目直接用给定 gist/why（可轻微润色），**不要编造、不要增删条目**；feed 栏目基于 abstract，信息不足以支撑结论的条目不写。")
     L.append("- feed 栏目**宁缺毋滥**：相关条目不足时就少给（可低于 min），**不要为凑数硬塞**；兴趣类内容与主业无关时可省略。")

@@ -75,6 +75,11 @@
   "未选中的标记。"
   :group 'radar)
 
+(defface radar-read-face
+  '((t :inherit success :weight bold))
+  "整份日报已读。"
+  :group 'radar)
+
 ;;; 配置 / 路径 -------------------------------------------------------
 
 (defun radar--config-file () (expand-file-name "config.toml" radar-repo-root))
@@ -115,11 +120,24 @@
         (push (match-string 1 b) res)))
     res))
 
+(defun radar--download-prefixes ()
+  "config.toml 里可下载（未写 download=false）栏目的 prefix 列表。"
+  (let ((blocks nil) (res nil))
+    (when (file-readable-p (radar--config-file))
+      (setq blocks (cdr (split-string (radar--slurp (radar--config-file))
+                                      "\\[\\[sections\\]\\]"))))
+    (dolist (b blocks)
+      (when (and (string-match "^[ \t]*prefix[ \t]*=[ \t]*\"\\([^\"]+\\)\"" b)
+                 (not (string-match "^[ \t]*download[ \t]*=[ \t]*false" b)))
+        (push (match-string 1 b) res)))
+    res))
+
 (defun radar--digests ()
-  "所有日报 md（按日期升序）。"
+  "所有日报 md（按日期升序；只认 YYYY-MM-DD.md，排除阅读报告等）。"
   (let ((dir (radar--digest-dir)))
     (when (file-directory-p dir)
-      (sort (directory-files-recursively dir "\\.md\\'") #'string<))))
+      (seq-filter (lambda (f) (string-match-p "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\'" (file-name-base f)))
+                  (sort (directory-files-recursively dir "\\.md\\'") #'string<)))))
 
 (defun radar--find-digest (date files)
   (seq-find (lambda (f) (equal (file-name-base f) date)) files))
@@ -171,7 +189,18 @@
           (setf (radar-item-tokens item)
                 (split-string (string-trim (match-string 1 trimmed)) "[ \t]+" t)))))
       (setq i (1+ i)))
-    (when item (setf (radar-item-end item) i) (push item items))
+    (when item
+      (let ((end i)
+            (ri (radar--read-line-index lines)))
+        (when ri
+          (let ((j ri))
+            (while (and (> j 0)
+                        (let ((s (string-trim (nth (1- j) lines))))
+                          (or (string-empty-p s) (string-match-p "\\`-\\{3,\\}\\'" s))))
+              (setq j (1- j)))
+            (setq end j)))
+        (setf (radar-item-end item) end)
+        (push item items)))
     (dolist (s secs)
       (setf (radar-section-items s) (nreverse (radar-section-items s))))
     (list (nreverse secs) (nreverse items))))
@@ -182,11 +211,15 @@
 (defvar-local radar--files nil)
 (defvar-local radar--index 0)
 (defvar-local radar--items nil)
+(defvar-local radar--is-read nil)
 
 (defun radar--header ()
-  (format " Research Radar · %s  (%d/%d) "
-          (file-name-base (or radar--file ""))
-          (1+ radar--index) (length radar--files)))
+  (let ((s (format " Research Radar · %s  (%d/%d) "
+                   (file-name-base (or radar--file ""))
+                   (1+ radar--index) (length radar--files))))
+    (if radar--is-read
+        (propertize (concat s " ✓ 已读 ") 'face 'radar-read-face)
+      s)))
 
 (defun radar--plain (s)
   (replace-regexp-in-string "\\*\\*\\(.+?\\)\\*\\*" "\\1" s))
@@ -219,9 +252,12 @@ http(s) 原样返回；其它（`file:' 或相对文件名，如“标题.pdf”
     (insert (radar--plain (substring s pos)))))
 
 (defun radar--marks-for (item)
-  (if (member (radar-item-prefix item) (radar--queue-prefixes))
-      '("like" "dislike" "confused" "learned")
-    '("like" "dislike" "confused" "save")))
+  "该条目可用的标记：基础 like/dislike/confused；可下载栏目加 save；课程栏目加 learned。"
+  (let ((p (radar-item-prefix item))
+        (marks '("like" "dislike" "confused")))
+    (when (member p (radar--download-prefixes)) (setq marks (append marks '("save"))))
+    (when (member p (radar--queue-prefixes)) (setq marks (append marks '("learned"))))
+    marks))
 
 (defun radar--insert-marks (item)
   (insert (propertize "    标记：" 'face 'radar-field-face))
@@ -255,10 +291,41 @@ http(s) 原样返回；其它（`file:' 或相对文件名，如“标题.pdf”
       (insert "\n"))
     (put-text-property start (point) 'radar-item item)))
 
+(defun radar--read-line-index (lines)
+  "整份日报最末「- **已读**：」行的下标；没有则 nil。"
+  (let ((i 0) (found nil))
+    (dolist (ln lines)
+      (when (string-match "\\`\\s-*- \\*\\*已读\\*\\*：" ln) (setq found i))
+      (setq i (1+ i)))
+    found))
+
+(defun radar--read-value (lines)
+  "「已读」行的值（已 trim）；没有该行时 nil。"
+  (let ((i (radar--read-line-index lines)))
+    (when i
+      (string-match "\\`\\s-*- \\*\\*已读\\*\\*：\\(.*\\)" (nth i lines))
+      (string-trim (match-string 1 (nth i lines))))))
+
+(defun radar-toggle-read ()
+  "切换整份日报的「已读」标记（在最末补/改一行）。"
+  (interactive)
+  (let* ((file radar--file)
+         (lines (radar--lines file))
+         (i (radar--read-line-index lines))
+         (was (and i (not (string-empty-p (or (radar--read-value lines) ""))))))
+    (if i
+        (setf (nth i lines) (format "- **已读**：%s" (if was "" " yes")))
+      (setq lines (append lines (list "" "---" "" "- **已读**： yes"))))
+    (radar--write-lines file lines)
+    (radar--render)
+    (message "整份日报：%s" (if was "已取消「已读」" "已标记为已读"))))
+
 (defun radar--render ()
   "按 `radar--file' 重画整个缓冲。"
   (let ((inhibit-read-only t)
         (lines (radar--lines radar--file)))
+    (setq radar--is-read (and (radar--read-line-index lines)
+                              (not (string-empty-p (or (radar--read-value lines) "")))))
     (erase-buffer)
     (pcase-let ((`(,secs ,items) (radar--parse lines)))
       (setq radar--items items)
@@ -267,6 +334,15 @@ http(s) 原样返回；其它（`file:' 或相对文件名，如“标题.pdf”
         (dolist (it (radar-section-items sec))
           (radar--insert-item it lines))
         (insert "\n")))
+    (let* ((ri (radar--read-line-index lines))
+           (read (and ri (not (string-empty-p (or (radar--read-value lines) ""))))))
+      (insert "\n" (propertize "──── 整份日报 ────" 'face 'radar-field-face) "\n")
+      (insert (propertize "已读：" 'face 'radar-field-face))
+      (insert-button (format "[%s]" (if read "✔ 已读" "  未读"))
+                     'action (lambda (_) (radar-toggle-read))
+                     'follow-link t 'help-echo "点击切换「已读」"
+                     'face (if read 'radar-mark-on-face 'radar-mark-off-face))
+      (insert "\n"))
     (delete-char -1)
     (goto-char (point-min))))
 
@@ -325,11 +401,11 @@ http(s) 原样返回；其它（`file:' 或相对文件名，如“标题.pdf”
      (t (user-error "打不开（文件不存在）：%s" target)))))
 
 (defun radar-open-folder ()
-  "打开当天日报所在文件夹。"
+  "在文件管理器中打开当天日报目录，并选中日报文件。"
   (interactive)
   (start-process "radar-open" "*radar-open*"
                  (expand-file-name radar-open-program radar-repo-root)
-                 (file-name-directory radar--file)))
+                 "--select" radar--file))
 
 (defun radar-mark-at-point (token)
   "给光标所在条目切换 TOKEN 标记。"
@@ -372,6 +448,23 @@ http(s) 原样返回；其它（`file:' 或相对文件名，如“标题.pdf”
           (message "%s" (or (car (last (split-string (string-trim (buffer-string)) "\n" t)))
                             "已应用")))))))
 
+(defun radar-pdf-saved ()
+  "下载当前日报里所有标了 save 的条目（调用 bin/radar-pdf --saved --date <日期>）。"
+  (interactive)
+  (let ((script (expand-file-name "bin/radar-pdf" radar-repo-root))
+        (date (file-name-base (or radar--file ""))))
+    (cond
+     ((not (file-executable-p script)) (message "找不到 bin/radar-pdf"))
+     ((string-empty-p date) (message "还没有打开日报"))
+     (t
+      (let ((default-directory (file-name-as-directory radar-repo-root))
+            (out nil))
+        (with-temp-buffer
+          (call-process script nil t nil "--saved" "--date" date)
+          (setq out (car (last (split-string (string-trim (buffer-string)) "\n" t)))))
+        (radar-revert)
+        (message "%s" (or out "已下载")))))))
+
 (defun radar--goto-day (delta)
   (let ((i (+ radar--index delta)))
     (if (and (>= i 0) (< i (length radar--files)))
@@ -393,8 +486,20 @@ http(s) 原样返回；其它（`file:' 或相对文件名，如“标题.pdf”
   (radar--render)
   (message "已重新读取 %s" (file-name-base radar--file)))
 
+(defun radar-show-all ()
+  "展开被 outline/hs/org 折叠的内容，并重画当前日报。"
+  (interactive)
+  (dolist (fn '(outline-show-all hs-show-all org-show-all))
+    (when (fboundp fn) (ignore-errors (funcall fn))))
+  (radar--render)
+  (message "已展开全部内容"))
+
 (defun radar--session-id (date)
-  "当天日报在本机生成的 opencode session id；若不是本机生成则 nil。"
+  "当天日报在本机生成、且为 opencode 原生 id 的 session；否则 nil。
+
+opencode 自己创建的 session id 形如 `ses_<26位>`；早期 radar 用的
+`ses-radar-<日期>` 是自定义 id，免费模型会报 “free tier can only be used
+from within OpenCode”，这里一并排除（返回 nil → 开新会话）。"
   (let ((f (expand-file-name (format "sessions/%s.id" date) (radar--state-dir)))
         (host (car (split-string (or (system-name) "") "\\."))))
     (when (file-readable-p f)
@@ -402,7 +507,7 @@ http(s) 原样返回；其它（`file:' 或相对文件名，如“标题.pdf”
              (parts (split-string txt "\t")))
         (when (and (= (length parts) 2)
                    (equal (car (split-string (car parts) "\\.")) host)
-                   (string-prefix-p "ses" (cadr parts)))
+                   (string-prefix-p "ses_" (cadr parts)))
           (cadr parts))))))
 
 (defcustom radar-agent-config-maker 'agent-shell-opencode-make-agent-config
@@ -449,10 +554,14 @@ session 所属项目——所以这里必须保证在仓库目录下运行（`ra
     ("s" "save（收藏）" (lambda () (interactive) (radar-mark-at-point "save")))
     ("e" "learned（学会/归档）" (lambda () (interactive) (radar-mark-at-point "learned")))
     ("a" "应用标记（radar fb parse）" radar-apply)]
+   ["下载 / 已读"
+    ("D" "下载本页已标 save 的条目" radar-pdf-saved)
+    ("R" "切换整份日报「已读」" radar-toggle-read)]
    ["日报"
     ("[" "前一天" radar-prev-day)
     ("]" "后一天" radar-next-day)
     ("g" "重新读取文件" radar-revert)
+    ("=" "展开全部内容" radar-show-all)
     ("C" "与 opencode 细聊" radar-chat)]])
 
 (defvar radar-mode-map
@@ -466,9 +575,12 @@ session 所属项目——所以这里必须保证在仓库目录下运行（`ra
     (define-key m (kbd "[") #'radar-prev-day)
     (define-key m (kbd "]") #'radar-next-day)
     (define-key m (kbd "g") #'radar-revert)
+    (define-key m (kbd "=") #'radar-show-all)
     (define-key m (kbd "?") #'radar-menu)
     (define-key m (kbd "C") #'radar-chat)
     (define-key m (kbd "a") #'radar-apply)
+    (define-key m (kbd "D") #'radar-pdf-saved)
+    (define-key m (kbd "R") #'radar-toggle-read)
     (define-key m (kbd "o") #'radar-open-folder)
     (define-key m (kbd "l") (lambda () (interactive) (radar-mark-at-point "like")))
     (define-key m (kbd "d") (lambda () (interactive) (radar-mark-at-point "dislike")))
@@ -481,6 +593,10 @@ session 所属项目——所以这里必须保证在仓库目录下运行（`ra
   "Research Radar 日报阅读模式。"
   (setq-local truncate-lines nil)
   (setq-local word-wrap t)
+  ;; 本模式自己渲染，禁用 outline/hs 折叠（防止全局 outline-minor-mode 把内容折起来）
+  (setq-local outline-regexp "\\`\\`\\`\\`")
+  (when (fboundp 'outline-minor-mode) (outline-minor-mode -1))
+  (when (fboundp 'hs-minor-mode) (hs-minor-mode -1))
   (setq-local header-line-format '(:eval (radar--header)))
   (setq-local revert-buffer-function (lambda (&rest _) (radar-revert))))
 

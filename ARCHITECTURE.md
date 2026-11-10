@@ -246,6 +246,8 @@ download = false
 | 分点标签 | 该 `[[sections]]` 的 `fields` |
 | **免费模型顺序/兜底** | `[models] order` |
 | 多机主生成机 | `[general] generate_on`（留空=不限制） |
+| 生成方式 | `[general] mode`（`daily` / `progressive`） |
+| 整份日报条数上限 | `[general] max_total_items`（默认 6） |
 | 队列刷新周期 | `[curriculum] refresh_days` |
 
 > **职责划分**：`config.toml` = **业务参数（你常改）**；`.opencode/opencode.jsonc` = **OpenCode 自身接线（模型/权限/MCP）**。两者不混。
@@ -474,6 +476,7 @@ WantedBy=timers.target
 
 - **为什么 timer 而不是 `.desktop` autostart**：`Persistent`（错过补跑）、`journalctl --user` 有日志、可整点触发。
 - **一日一次（幂等）**：`bin/radar run` 用 `flock data/state/.run.lock` 防并发；若**当天日报已存在**则直接跳过（`radar run --force` 可强制重跑）。
+- **渐进模式**：`[general] mode = "progressive"` 时，生成前先看**最近一期**日报是否标了 `- **已读**：`（整份日报最末一行，TUI/Emacs 按 `R` 切换）；未读则只同步、跳过生成并通知。`daily` 则每天照常。显式 `--date` / `--force` 不受此限。
 - **网络等待**：用户级 unit 不便依赖 `network-online.target`，故在脚本里轮询（20×5s）网络可达再跑，超时则通知失败退出。
 - **延迟 90s**：避开开机负载尖峰。
 - **进系统较晚也不会漏**：`OnBootSec=90s` 保证**每次进系统后 90s 跑一次**（哪怕 23:00 才开机）；若 09:00 时机器关着，`Persistent=true` 会在开机后补跑那一次；两者重叠由"当日幂等"兜底。
@@ -503,7 +506,7 @@ order = ["deepseek/deepseek-flash", "opencode/space-bunny-free"]
 
 - **为什么默认 deepseek**：同一任务实测 **deepseek 28s vs 免费模型 1m33s**（3.3×）；成本约 **¥0.02/次**（≈ ¥0.6/月），可忽略。想换模型改这个列表即可。
 - **想用免费模型**：把免费模型放前面（免费但慢、质量略差）。
-- **关于 Zen 免费模型（2026-10 实测）**：多数在 CLI `opencode run` 下报 `free tier can only be used from within OpenCode`，目前**仅 `space-bunny-free` 可用**。
+- **关于 Zen 免费模型（2026-10 实测）**：免费模型是否可用，**取决于 session 是不是 opencode 自己创建的**。opencode 原生 session（id 形如 `ses_<26位>`）一切正常；早期 radar 用 `opencode run --session ses-radar-<日期>` 创建的自定义 id，请求头 `x-opencode-session` 不被推理服务端认，会报 `free tier can only be used from within OpenCode`。因此 `bin/radar` **不再指定 `--session`**，改为让 opencode 创建、成功后按标题回查 id 记入 `state/sessions/<日期>.id`。
 - **无人值守**：`bin/radar` 按 `order` 逐个 `opencode run --model <m>`，成功即止；全失败才报错。
 
 ## 16. 多主机同步与迁移 ★

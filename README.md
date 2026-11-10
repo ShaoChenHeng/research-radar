@@ -91,9 +91,10 @@ radar profile apply   # 把已作答的问题并入 profile.md
 radar pdf a1 a2        # 下指定条目（arXiv / hf-mirror 论文）
 radar pdf --saved      # 下所有在日报里标了 save 的条目
 ```
+> TUI / Emacs 里直接按 **`D`** 即可下载「当前日报里所有标了 save 的条目」（内部就是 `radar pdf --saved --date 当天`），下完自动刷新、显示 `- **本地**：` 行。
 > `save` **只是下载标记**（不进反馈）；反馈用 `like`/`dislike`。
 - 存到**当天文件夹** `data/digest/YYYY/MM/<date>/`，**文件名 = 条目标题**；并在日报该条下加一行 `- **本地**：[相对路径](…)`；
-- 只对 `[[sections]]` 里 `download = true` 的栏目生效（③ Linux 为 `false`，自动跳过）。
+- 只对 `[[sections]]` 里 `download = true` 的栏目生效（`false` 的栏目——如 Linux、科研动态——**不显示 `save`**、自动跳过）。
 
 ## 自动化（systemd，已启用）
 ```bash
@@ -107,6 +108,18 @@ journalctl --user -u research-radar.service -f   # 看日志
 - 跑完/失败会弹 **KDE 通知**（成功默认"日报已生成 · <日期>"）。
 - 关闭：`systemctl --user disable --now research-radar.timer`。
 
+## 生成模式与「已读」
+`config.toml` 的 `[general] mode` 有两种：
+
+- **`daily`**：每天照常生成。
+- **`progressive`**（默认）：只有**最近一期**日报标了「已读」，才生成今天这一期；否则 `radar run` 只同步、打印提示并跳过（`--force` 可强制；`--date` 指定日期也不受此限）。
+
+每份日报的**最末**（`---` 之下）有一行 `- **已读**：`：
+- 在 **TUI / Emacs** 里按 **`R`**（或点按钮）切换已读 / 未读；
+- **已读**的日报会在顶部把标题栏**高亮为绿色并显示 `✓ 已读`**（TUI 顶栏 + 首行标题；Emacs header-line）；
+- 它是整份日报的"读完了"标记，不属于任何条目，**不影响** `radar fb parse` / `radar pdf`；
+- 由 runner 在生成后**自动补上**，模型不用写。
+
 ## TUI（单栏读日报 + 就地打标）
 ```bash
 radar                # 直接打开界面（默认最新一天）
@@ -117,15 +130,16 @@ radar tui            # 同上；[ / ] 切前一天/后一天，H 打开历史列
 - 光标**逐行在文档上移动**：移到 `标记：` 行**自动弹候选**；移到**含网址的行**，底部状态栏提示 `Enter 打开链接`。
 - **`H` 打开「历史日报」列表**（像帮助那样浮层）：`j/k` 选日期、`Enter` 打开、`Esc`（或 `q`）取消。
 - **`Enter` 只对「含网址的行」生效**：先把链接开在**你当前屏幕**的浏览器窗口里（不切屏），再把它置顶；arXiv 链接按编号精确匹配到新标签所在窗口。`Y` 复制链接（不开浏览器）。
-- **`C` 与 opencode 细聊**：**直接进入对话**（不弹菜单）。默认接续「生成今天日报的那个 session」，模型已经读过候选、写过日报，上下文都在。若今天的日报是**别的主机**生成并同步过来的（本机没有那个 session），则用**本机固定的兜底 session**（`ses-radar-local-<日期>`，不存在即创建）并以一条预制 prompt 开场；**之后每次 `C` 都续同一个**。退出后界面自动恢复。
-- 键位（Emacs 风）：`j/k` 或 `C-n/C-p` 逐行；`C-v/M-v` 翻页；`M-<`/`M->` 首尾；**`[` / `]` 前一天 / 后一天**；`H` 历史；`C` 对话；`l 喜欢 d 不喜欢 c 看不懂 s 收藏 e 学会`（或按数字）；`a` 应用；`o` 打开文件夹；`g` 重新读取文件；`?` 帮助；`q` 退出。
+- **`C` 与 opencode 细聊**：**直接进入对话**（不弹菜单）。默认接续「生成今天日报的那个 session」，模型已经读过候选、写过日报，上下文都在。**若本机没有可用的原生 session**（日报是别的主机生成的，或旧日报记录的还是 `ses-radar-<日期>` 这种自定义 id），则**新建一个 opencode 原生 session**（保证免费模型可用）并以一条预制 prompt 开场；退出后记住它的 id，**之后每次 `C` 都续同一个**。退出后界面自动恢复。
+- 键位（Emacs 风）：`j/k` 或 `C-n/C-p` 逐行；`C-v/M-v` 翻页；`M-<`/`M->` 首尾；**`[` / `]` 前一天 / 后一天**；`H` 历史；`C` 对话；`l 喜欢 d 不喜欢 c 看不懂 s 收藏 e 学会`（或按数字；`s` 仅可下载栏目有、`e` 仅课程栏目有）；`a` 应用；`D` 下载本页已标 save 的条目；`R` 切换整份日报「已读」；`o` 在文件管理器中打开当天目录（选中日报）；`g` 重新读取文件；`?` 帮助；`q` 退出。
 - 打标**直接写进当天 md 的 `- **标记**：` 行**；`a` 才生效（`radar fb parse`）。
 
 ## Emacs 侧（`emacs/radar.el`）
 在 Emacs 里读日报、就地打标（结构化缓冲，**不是** markdown-mode）：
 - **加载**：`~/.emacs.d/lisp/init-radar.el` 把仓库的 `emacs/` 加进 `load-path` 并 `(require 'radar)`；入口 **`C-c R`**（`C-u C-c R` 选日期）。
-- **就地打标**：`标记：` 行渲染成**可点按钮**（like / dislike / confused / save|learned），点一下切换，**光标停在原按钮上不跳**；`l d c s e` 是等效快捷键；`a` 写回并应用（`radar fb parse`）。
-- **键位**：`n` / `p`（或 `TAB` / `<backtab>`）跳条目；`RET` 打开链接；`[` / `]` 前 / 后一天；`g` 重读文件；`o` 打开当天文件夹；`?` 打开菜单（transient）；`C` 与 opencode 细聊（以仓库为工作目录启动 agent-shell，`session/load` **续当天那个 session**；本机没有该 session 时开新会话）。
+- **就地打标**：`标记：` 行渲染成**可点按钮**（like / dislike / confused / `save`（仅可下载栏目）/ `learned`（仅课程栏目）），点一下切换，**光标停在原按钮上不跳**；`l d c s e` 是等效快捷键；`a` 写回并应用（`radar fb parse`）；**`D`** 下载本页已标 save 的条目（`radar pdf --saved`，下完自动重读）；**`R`** 切换整份日报「已读」（日报最末那行）。
+- **键位**：`n` / `p`（或 `TAB` / `<backtab>`）跳条目；`RET` 打开链接；`[` / `]` 前 / 后一天；`g` 重读文件；`=` 展开全部内容（若被 outline/hs 折叠）；`o` 在文件管理器中打开当天目录（选中日报）；`?` 打开菜单（transient）；`C` 与 opencode 细聊（以仓库为工作目录启动 agent-shell，`session/load` **续当天那个 session**；本机没有该 session 时开新会话）。
+- **折叠**：`radar-mode` 已显式禁用 outline/hs 折叠（并把 `outline-regexp` 设为不匹配）；若你在**原始 `.md`**（markdown-mode 等）里被折叠，按 `TAB` 或 `M-x outline-show-all`。
 - **打开链接**：统一走 `bin/radar-open`（Emacs 与 TUI 共用一套「当前屏打开 + 置顶」逻辑，arXiv 链接按编号精确匹配标签页）；本地 PDF 链接按**日报目录**解析成文件路径，先查存在性再打开（避免 KDE 弹 KIO 报错）。
 
 ## 配置

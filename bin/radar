@@ -118,6 +118,51 @@ except ValueError:
 PY
 }
 
+# 渐进模式：看「最近一期」（< 目标日期）日报是否标了「已读」→ 输出 ok 或 block:<date>
+progressive_state() {
+  local ddir="$1" today="$2"
+  python3 - "$ddir" "$today" <<'PY'
+import sys, os, glob, re, datetime
+ddir, today = sys.argv[1], sys.argv[2]
+dates = []
+for f in glob.glob(os.path.join(ddir, "**", "*.md"), recursive=True):
+    b = os.path.basename(f)[:-3]
+    try:
+        datetime.date.fromisoformat(b)
+    except ValueError:
+        continue
+    if b < today:
+        dates.append((b, f))
+if not dates:
+    print("ok"); sys.exit()
+dates.sort()
+lastf = dates[-1][1]
+try:
+    t = open(lastf, encoding="utf-8").read()
+except OSError:
+    print("ok"); sys.exit()
+m = re.search(r"(?m)^- \*\*已读\*\*：\s*(.*)$", t)
+val = (m.group(1).strip() if m else "")
+print("ok" if val else "block:" + dates[-1][0])
+PY
+}
+
+# 在日报最末补一行「- **已读**：」（保留已有值；幂等）
+ensure_read_line() {
+  python3 - "$1" <<'PY'
+import sys, re
+p = sys.argv[1]
+t = open(p, encoding="utf-8").read()
+m = re.search(r"(?m)^- \*\*已读\*\*：\s*(.*)$", t)
+val = m.group(1).strip() if m else ""
+t = re.sub(r"(?m)^- \*\*已读\*\*：[^\n]*\n?", "", t)
+t = t.rstrip()
+t = re.sub(r"\n*-{3,}\s*$", "", t).rstrip()
+t = t + "\n\n---\n\n- **已读**：" + ((" " + val) if val else "") + "\n"
+open(p, "w", encoding="utf-8").write(t)
+PY
+}
+
 usage() {
   cat <<'EOF'
 用法:
@@ -227,7 +272,6 @@ cmd_run() {
   raw="$state_dir/raw/$d"
   local day_dir="$digest_dir/$y/$mo/$d"
   out="$day_dir/$d.md"
-  mkdir -p "$day_dir"
 
   RADAR_DATE="$d"; SYNC_ROOT="$data_root"
 
@@ -245,6 +289,16 @@ cmd_run() {
     fi
     if [ -s "$out" ] && [ "$force" != 1 ]; then
       echo "[radar] 今天已生成，跳过（--force 可强制重跑）"; exit 0
+    fi
+    # 渐进模式：最近一期未标「已读」则今天不生成（显式 --date / --force 时不受限）
+    if [ -z "$force_date" ] && [ "$force" != 1 ] && [ "$(cfg general.mode)" = "progressive" ]; then
+      local pst; pst="$(progressive_state "$digest_dir" "$d")"
+      case "$pst" in
+        block:*)
+          echo "[radar] 最近一期（${pst#block:}）还没标「已读」，今天先不生成；读完再跑，或加 --force"
+          notify "上一期日报还没读（${pst#block:}），今天先不生成"
+          exit 0;;
+      esac
     fi
     net_wait || die "网络不可达（等待超时）"
     time_wait || die "系统时间未同步（可能切系统/时区导致）；已跳过，避免归档到错误日期。请检查 NTP 或 Windows RTC 设置"
@@ -281,11 +335,27 @@ cmd_run() {
   # 3) queue 栏目选条目（间隔重复）
   local intervals; intervals="$(cfg curriculum.intervals_days | paste -sd, -)"; intervals="${intervals:-1,3,7,16,35}"
   local sel="{}"
+  # 总条数上限：先给 feed 栏的 min 之和留底，剩下的才分给 queue 栏（避免课程栏把名额吃光）
+  local total_max feed_min qbudget
+  total_max="$(cfg general.max_total_items)"; total_max="${total_max:-0}"
+  feed_min="$(python3 - "$CONFIG" <<'PY'
+import sys, tomllib
+c = tomllib.load(open(sys.argv[1], "rb"))
+print(sum(int(s.get("min", 1)) for s in c.get("sections", []) if s.get("kind") == "feed"))
+PY
+)"
+  qbudget=$(( total_max - feed_min )); [ "$qbudget" -lt 0 ] && qbudget=0
   while IFS=$'\t' read -r sid smn smx sq; do
     [ -z "$sid" ] && continue
+    local effmx="${smx:-2}"
+    if [ "$total_max" -gt 0 ] && [ "$effmx" -gt "$qbudget" ]; then effmx="$qbudget"; fi
     local rows
-    rows="$("$ROOT/bin/radar-state" queue-pick "$data_root/$sq" "${smn:-1}" "${smx:-2}" "$d" "$intervals")"
+    rows="$("$ROOT/bin/radar-state" queue-pick "$data_root/$sq" "${smn:-1}" "$effmx" "$d" "$intervals")"
     sel="$(python3 -c 'import sys,json;d=json.loads(sys.argv[1]);d[sys.argv[2]]=json.loads(sys.argv[3]);print(json.dumps(d,ensure_ascii=False))' "$sel" "$sid" "$rows")"
+    if [ "$total_max" -gt 0 ]; then
+      local picked; picked="$(printf '%s' "$rows" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)"
+      qbudget=$(( qbudget - picked )); [ "$qbudget" -lt 0 ] && qbudget=0
+    fi
   done < <(ccfg queue-sections)
 
   if [ "$dry" = 1 ]; then
@@ -303,24 +373,33 @@ cmd_run() {
     echo "[radar] dry-run —— 输出路径: $out"; echo "----- prompt -----"; echo "$prompt"; return 0
   fi
 
+  mkdir -p "$day_dir"   # 只在真正要生成时建目录（渐进拦截/失败时不留空目录）
+
   # 5) 模型 fallback（按 [models].order 顺序尝试）；全失败等 5 分钟再试
   local models=()
   while IFS= read -r line; do [ -n "$line" ] && models+=("$line"); done < <(cfg models.order)
-  # 本次日报对应的固定 session id：TUI 里按 C 会续这个 session 细聊（上下文都在）
+  # 本次日报的 session：**必须让 opencode 自己创建**（不能用 ses-radar-<日期> 这种
+  # 自定义 id）。自定义 id 会让请求头 x-opencode-session 不被 OpenCode 服务端认，
+  # 导致免费模型报 “free tier can only be used from within OpenCode”。
+  # 生成成功后按标题回查 opencode 分配的 id，写进 state/sessions/<日期>.id 供 TUI 按 C 续聊。
   # 记录生成它的主机：若日报是别的主机生成并同步过来的，TUI 会改用新对话兜底
-  local sid="ses-radar-$d"
+  local title="Research Radar · $d" sid=""
   mkdir -p "$state_dir/sessions"
-  printf '%s\t%s\n' "$host" "$sid" > "$state_dir/sessions/$d.id"
 
   local retry_max="${RADAR_RETRIES:-3}" retry_wait="${RADAR_RETRY_WAIT:-300}" attempt=1
   while :; do
     for model in "${models[@]}"; do
       [ -z "$model" ] && continue
       echo "[radar] 尝试模型: $model（第 $attempt 轮）"
-      if timeout "$RUN_TIMEOUT" opencode run --session "$sid" --title "Research Radar · $d" --model "$model" --auto "$prompt"; then
+      if timeout "$RUN_TIMEOUT" opencode run --title "$title" --model "$model" --auto "$prompt"; then
         if [ -s "$out" ]; then
           "$ROOT/bin/radar-state" seen-record "$out" "$seen" "$d" "$host" "$raw/candidates.jsonl" "$CONFIG"
-          echo "[radar] ✅ 生成成功: $out"
+          ensure_read_line "$out"
+          sid="$(opencode session list 2>/dev/null | awk -F'\t' -v t="$title" '$2==t{print $1; exit}')" || true
+          if [ -n "$sid" ]; then
+            printf '%s\t%s\n' "$host" "$sid" > "$state_dir/sessions/$d.id"
+          fi
+          echo "[radar] ✅ 生成成功: $out${sid:+ (session $sid)}"
           sync_push
           notify "$(cfg notify.success_text) · $d"
           return 0
